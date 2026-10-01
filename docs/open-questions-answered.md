@@ -163,12 +163,17 @@ pull the mark back to fair value before 2026-11-04.**
 
 ### Consequences
 
-1. **The leaderboard is largely fictional.** Unrealized P&L marks every position
-   at this inflated VWAP. The leader's +374,645 on a 100,000 start, and the
-   cluster of accounts at exactly `roi: 500`, are consistent with mark-to-VWAP
-   artifacts rather than realized cash. HANDOFF §4's "leaders up +359k in ~2h"
-   is most likely the same artifact, not evidence of a skill edge we need to
-   match. **The real competition is weaker than the board suggests.**
+1. **Leaderboard marks are unrelated to fair value.** Unrealized P&L marks every
+   position at the cumulative VWAP, which can overstate a position badly (market
+   388's mark was 6.2x its best ask) or understate it, depending on whether early
+   prints sat above or below the current price. It is noise, not a systematic
+   inflation.
+   **Partly superseded — see `docs/sweep-opportunity.md`.** An earlier version of
+   this note called the board "largely fictional" and guessed the leaders' P&L was
+   pure marking artifact. Trade-history analysis since shows ~226,000 SUSQies of
+   *real* value transferred to passive resting bids across 30 markets in five
+   hours, so competitors who caught those sweeps are genuinely ahead. The leaders'
+   figures are likely a mix of real capture and arbitrary marks.
 2. **Only the final settled balance scores** (rules §Scoring), and settlement
    pays 1 or 0 per share — never the VWAP. So the inflated mark converts to
    nothing. HANDOFF §2's "do not optimize the displayed balance" is now
