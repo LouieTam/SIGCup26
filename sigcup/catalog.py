@@ -4,15 +4,20 @@
 resolution spec (raceId, winnerName, resolutionType, usState). That is strictly
 better than the Info-tab prose, and raceId pairs the legs of a race exactly.
 
-One node read per market, so building the catalog costs ~237 reads (~2.5 min
-under the 100 read/min budget). Cache it; markets don't change intraday.
+One node read per market. The binding cost is *latency*, not the rate budget:
+this API answers in ~2-17s per call, so 237 sequential reads take ~20 minutes.
+Fetched concurrently instead — the client's rate limiter is thread-safe, so
+workers still share the one 100 reads/min account budget. Cache the result;
+markets don't change intraday.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import threading
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 CATALOG_PATH = "data/catalog.json"
@@ -31,33 +36,49 @@ _DETAIL_KEYS = (
 )
 
 
-def build_catalog(client, verbose: bool = True) -> list[dict]:
+def _base_row(m: dict) -> dict[str, Any]:
+    exchanges = m.get("exchanges") or []
+    return {
+        "marketId": str(m["id"]),
+        "title": m.get("title"),
+        "status": m.get("status"),
+        "settlementDate": m.get("settlementDate"),
+        "isMultiOutcome": m.get("isMultiOutcome"),
+        "exchangeId": str(exchanges[0]["id"]) if exchanges else None,
+        "exchangeCount": len(exchanges),
+    }
+
+
+def _fetch_node(client, row: dict) -> dict:
+    try:
+        root = client._get(
+            f"/markets/{row['marketId']}/nodes", tournamentId=client.tournament_id
+        )["root"]
+        details = root.get("contract_details") or {}
+        row["nodeContractType"] = root.get("contract_type")
+        for k in _DETAIL_KEYS:
+            row[k] = details.get(k)
+    except Exception as e:  # keep the row; needs_review() will flag it
+        row["nodeError"] = f"{type(e).__name__}: {e}"
+    return row
+
+
+def build_catalog(client, verbose: bool = True, workers: int = 8) -> list[dict]:
     markets = client.tournament_markets()
-    rows: list[dict] = []
-    for i, m in enumerate(markets, 1):
-        exchanges = m.get("exchanges") or []
-        row: dict[str, Any] = {
-            "marketId": str(m["id"]),
-            "title": m.get("title"),
-            "status": m.get("status"),
-            "settlementDate": m.get("settlementDate"),
-            "isMultiOutcome": m.get("isMultiOutcome"),
-            "exchangeId": str(exchanges[0]["id"]) if exchanges else None,
-            "exchangeCount": len(exchanges),
-        }
-        try:
-            root = client._get(
-                f"/markets/{m['id']}/nodes", tournamentId=client.tournament_id
-            )["root"]
-            details = root.get("contract_details") or {}
-            row["nodeContractType"] = root.get("contract_type")
-            for k in _DETAIL_KEYS:
-                row[k] = details.get(k)
-        except Exception as e:  # keep the row; flag it for review
-            row["nodeError"] = f"{type(e).__name__}: {e}"
-        rows.append(row)
-        if verbose and i % 25 == 0:
-            print(f"  …{i}/{len(markets)} markets")
+    rows = [_base_row(m) for m in markets]
+    done = 0
+    lock = threading.Lock()
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_fetch_node, client, r): r for r in rows}
+        for fut in as_completed(futures):
+            fut.result()
+            with lock:
+                done += 1
+                if verbose and done % 20 == 0:
+                    print(f"  …{done}/{len(rows)} markets", flush=True)
+
+    rows.sort(key=lambda r: int(r["marketId"]))
     return rows
 
 

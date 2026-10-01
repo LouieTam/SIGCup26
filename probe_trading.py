@@ -33,9 +33,16 @@ def h(t: str) -> None:
     print(f"\n{'=' * 70}\n{t}\n{'=' * 70}")
 
 
-def pick_exchange(c: SuperMarketClient, prefer_state: str | None) -> dict:
-    """A liquid-ish market to probe. Prefers the requested state."""
+def pick_exchange(
+    c: SuperMarketClient, prefer_state: str | None, market_id: str | None = None
+) -> dict:
+    """A market to probe. An explicit --market-id wins; else first in the state."""
     rows = load_catalog()
+    if market_id:
+        hit = [r for r in rows if r["marketId"] == str(market_id)]
+        if not hit:
+            raise SystemExit(f"market {market_id} not in data/catalog.json")
+        return hit[0]
     pool = select(rows, state=prefer_state) if prefer_state else []
     if not pool:
         pool = [r for r in rows if r.get("exchangeId")]
@@ -48,10 +55,11 @@ def main() -> int:
     ap.add_argument("--yes", action="store_true", help="actually place orders")
     ap.add_argument("--unwind", action="store_true", help="close the 1-share position afterwards")
     ap.add_argument("--state", default="RI", help="prefer a market in this state (default RI)")
+    ap.add_argument("--market-id", help="probe this exact marketId (overrides --state)")
     args = ap.parse_args()
 
     load_env()
-    target = pick_exchange(SuperMarketClient(), args.state)
+    target = pick_exchange(SuperMarketClient(), args.state, args.market_id)
     exid, mid = target["exchangeId"], target["marketId"]
 
     print("PLAN")

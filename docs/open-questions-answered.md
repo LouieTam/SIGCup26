@@ -61,23 +61,43 @@ context.
 - An opposite-signed `buy` **nets against** the existing position at FIFO lot
   cost rather than opening a new one.
 
-## 3. Do resting bids lock capital? — NOT ANSWERED (needs a live test)
+## 3. Do resting bids lock capital? — tested: `myBalance` does NOT move
 
-Not documented. The evidence is indirect and points toward **yes**:
+Measured 2026-10-01 via `probe_trading.py` on exchange 1077 (market 388):
 
-- The portfolio guide lists "Available SUSQie balance" as distinct from
-  position value, which implies a reserved bucket.
-- `POST /orders` returns `400` for "insufficient balance".
-- `GET /portfolio/collateral` exists but only reports *ALL-relationship*
-  collateral advances — and we have **no ALL relationships** (see Q9), so it
-  returns nothing useful for us.
+```
+balance before:          100,000.0000
+placed 1000 YES @ 0.01   open=True traded=0     (10.00 notional)
+balance while resting:   100,000.0000   delta +0.0000
+expected if reserved:         10.0000
+after cancel-all:        100,000.0000
+```
 
-No read endpoint exposes a free-vs-reserved split. **This needs one cheap
-empirical test:** read `myBalance`, rest a far-from-market bid (e.g. 1,000
-shares at 0.01 = 10 SUSQies notional), re-read `myBalance`, then cancel. If the
-balance drops by 10, bids reserve `price × qty` and the ladder's total notional
-is capped by cash. This is the single most important unknown for ladder sizing,
-and it's blocked only because no orders were to be placed in this step.
+So a resting bid does not reduce `myBalance`, and `GET /portfolio/collateral`
+returns `{"data": []}` (it only ever reports ALL-relationship advances, and we
+have no ALL relationships — see Q9).
+
+**Caveat, and it matters.** This proves `myBalance` is unaffected; it does *not*
+prove there is no reservation. The product guide shows an "Available SUSQie
+balance" in the web portfolio, and `POST /orders` can fail `400` for
+insufficient balance — so the engine may well track an available figure that
+`myBalance` does not expose. Two readings fit the evidence:
+
+- **No reservation at all.** The ladder can be arbitrarily deep, and the engine
+  must therefore reject or cancel at *fill* time if cash runs short.
+- **Reservation against a hidden available balance.** `myBalance` is total cash,
+  and the ladder is still capped — we just can't see the cap.
+
+The discriminating test is to rest a bid whose notional *exceeds* the balance
+(e.g. 150,000) and see whether it is accepted. **Not run:** on a real book that
+means briefly resting an order we could not pay for, and a sweep into it during
+the few seconds before cancellation would open a position worth more than half
+the account. That's a sizing decision, not a technical one — needs a human call
+on acceptable exposure.
+
+Until it's settled, **cap total resting ladder notional at the cash balance**.
+That is correct under both readings and costs nothing if reservation turns out
+to be absent.
 
 ## 4. Fees — answered: none
 
@@ -106,28 +126,62 @@ something unpublished, or limits are enforced server-side without being
 documented. Assume our own risk caps are the only ones and watch for an
 undocumented rejection code on the first large order.
 
-## 6. How the leaderboard marks positions — partly answered
+## 6. How the leaderboard marks positions — ANSWERED: cumulative VWAP
 
-`GET /tournaments/{slug}/leaderboard` ranks by `pnl` (realized + unrealized) and
-returns `rank, profileId, username, pnl, tradesCount, volume, winRate, roi`.
-Ranking is standard competition ranking (1-1-3).
+**`valuation_price` is the volume-weighted average price of every trade in the
+market's entire history.** Not last trade, not mid, not bid, not ask.
 
-Unrealized P&L uses the **tournament `valuation_price`** — the spec names it but
-never defines it. Two data points:
+Measured on exchange 1077 by taking a 1-share position and reconstructing the
+VWAP from `GET /exchanges/{id}/price-history`:
 
-- `Position.currentPrice` = "tournament valuation price".
-- `CombinedOrderbookExchange.impliedProbability` = "**best ask** price, or
-  `latestPrice` if no asks exist" — so at least the market-card probability is
-  an *ask*, not a last trade.
+```
+cumulative VWAP over all candles (3,019,992 shares) = 0.310033
+Position.currentPrice (valuation_price)             = 0.310033
+difference                                          = 0.000000
+executable book at that moment: bestBid 0.04 / bestAsk 0.05
+```
 
-If `valuation_price` follows the same rule, HANDOFF §3.2's claim that displayed
-probabilities are last-trade prices is **wrong for the book-derived field** and
-right only for `latestPrice`. Confirming requires holding one position and
-comparing `currentPrice` against that exchange's book — do this alongside the
-Q3 test.
+**The mark was 6.2x the best ask.** It drifts slowly downward as new prints
+accumulate into the average (0.310075 → 0.310033 over ~40s).
 
-Either way the strategic conclusion in HANDOFF §2 stands: only the **final
-settled balance** scores, so do not optimize the displayed mark.
+The cause is the chaotic open. Market 388's hourly candles:
+
+| hour (UTC) | open | high | low | close | vwap | volume |
+|---|---|---|---|---|---|---|
+| 16:00 | 0.05 | **0.995** | 0.005 | 0.03 | 0.544 | 1,062,038 |
+| 17:00 | 0.035 | 0.945 | 0.005 | 0.05 | 0.206 | 1,004,806 |
+| 18:00 | 0.05 | 0.745 | 0.015 | 0.045 | 0.211 | 595,795 |
+| 19:00 | 0.03 | 0.225 | 0.01 | 0.035 | 0.073 | 356,954 |
+
+The first hour printed between 0.005 and 0.995 on a contract now worth ~0.045.
+Those prints are permanently baked into the cumulative average, and because the
+denominator is already ~3M shares, **no realistic amount of honest trading will
+pull the mark back to fair value before 2026-11-04.**
+
+### Consequences
+
+1. **The leaderboard is largely fictional.** Unrealized P&L marks every position
+   at this inflated VWAP. The leader's +374,645 on a 100,000 start, and the
+   cluster of accounts at exactly `roi: 500`, are consistent with mark-to-VWAP
+   artifacts rather than realized cash. HANDOFF §4's "leaders up +359k in ~2h"
+   is most likely the same artifact, not evidence of a skill edge we need to
+   match. **The real competition is weaker than the board suggests.**
+2. **Only the final settled balance scores** (rules §Scoring), and settlement
+   pays 1 or 0 per share — never the VWAP. So the inflated mark converts to
+   nothing. HANDOFF §2's "do not optimize the displayed balance" is now
+   quantitatively justified, not just prudent.
+3. **Never use `currentPrice`, `marketValue`, or `unrealizedPnl` for risk or
+   sizing decisions.** They are off by multiples. Compute our own mark from the
+   order book. This applies to `GET /portfolio/pnl` and the P&L fields on every
+   portfolio read.
+4. There is an obvious rank-inflation trade available to anyone who notices
+   (buy cheap in a high-VWAP market, book an instant paper gain). It yields no
+   settled SUSQies, so it is not worth doing — but expect others to be doing it,
+   which further decouples the board from reality.
+5. Three different "prices" coexist and must not be confused:
+   `latestPrice` (last trade), `impliedProbability` (**best ask**, per the
+   schema), and `valuation_price` (cumulative VWAP). HANDOFF §3.2's rule "always
+   compute from the order book" is right, and now has a sharper reason.
 
 ## 7. WebSocket / streaming — answered: yes
 
@@ -242,7 +296,21 @@ budget.
    is 2026-11-04T17:00Z, the same instant trading closes, and autosettlement
    workers only run every 4 hours. Final rank depends on settlement that
    happens after we can no longer act.
-4. **The leader was at +374,645 on a 100,000 start (ROI 500%) ~7h after open**,
-   on 150 trades and only 49,902 volume. Several top accounts show exactly
-   `roi: 500`, which looks like a cap or a mark artifact rather than realized
-   cash. Worth understanding before treating leaderboard P&L as a target.
+4. **The leaderboard is marked at cumulative VWAP, not executable prices** — see
+   Q6. Resolved, and the answer is that leaderboard P&L should be ignored
+   entirely.
+5. **The API is slow: 2–17s per call** (`/account` took 17.5s, `/nodes` ~5s,
+   market list 7.6s). The 100 reads/min budget is *not* the binding constraint
+   on reaction speed — latency is. A quoter that re-reads a book over REST
+   before re-posting is already many seconds stale, so the Realtime websocket
+   feed (which pushes versioned books) is **mandatory for the quoter, not an
+   optimization**. Concurrency helps throughput: the catalog build went from
+   ~20 min sequential to 2m31s with 8 threads sharing the rate limiter.
+6. **`GET /tournaments/{slug}/portfolio/positions` does not use the standard
+   `data`/`pagination` envelope** — it returns `{positions, summary}`. Routing it
+   through a generic pager silently yields an empty list (this bit us once; the
+   client now special-cases it). Verify envelope shape per endpoint rather than
+   assuming the documented pagination contract applies.
+7. **`TournamentSummary` omits documented required fields.** `joinedAt` is
+   absent and `marketCount` / `memberCount` are present but undocumented. Treat
+   the spec's `required` arrays as advisory and use `.get()`.

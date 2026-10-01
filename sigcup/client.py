@@ -258,7 +258,14 @@ class SuperMarketClient:
         return self.tournament(slug)["myBalance"]
 
     def positions(self, slug: str | None = None) -> list[dict]:
-        return list(self._paged(f"/tournaments/{slug or self.tournament_slug}/portfolio/positions"))
+        """NB: this endpoint does NOT use the data/pagination envelope — it
+        returns {positions, summary}. Do not route it through _paged()."""
+        r = self._get(f"/tournaments/{slug or self.tournament_slug}/portfolio/positions", limit=100)
+        return r.get("positions") or []
+
+    def positions_summary(self, slug: str | None = None) -> dict:
+        r = self._get(f"/tournaments/{slug or self.tournament_slug}/portfolio/positions", limit=100)
+        return r.get("summary") or {}
 
     def pnl(self, slug: str | None = None) -> dict:
         return self._get(f"/tournaments/{slug or self.tournament_slug}/portfolio/pnl")
