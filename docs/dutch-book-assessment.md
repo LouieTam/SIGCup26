@@ -7,20 +7,41 @@ for dislocations, where both edge and size get large.
 
 ## The arithmetic that kills it
 
-For n mutually exclusive legs, buy NO on every leg: cost `n - Σbid`, payout at
-least `n - 1`. Locked profit per share is `Σbid - 1`, independent of n.
+Selling YES at `b` without holding YES *is* buying NO at `1 - b` — identical
+cash flows, and the engine canonicalizes it that way
+(`sell yes q@p ≡ buy no q@(1−p)`).
 
-The capital locked per share is `n - Σbid ≈ 1`. So:
+So hit the best YES bid on each of n mutually exclusive legs:
 
-$$\text{ROC} = \frac{\Sigma b - 1}{n - \Sigma b} \approx \frac{\text{edge}}{1} = \text{edge}$$
+- **cost** = `Σ(1 - bᵢ)` = `n - Σb`
+- **payout**: each NOᵢ pays 1 unless outcome i occurs. At most one can occur, so
+  payout is `n - 1` when exactly one wins and `n` when none does — never less
+  than `n - 1`.
+- **profit** ≥ `(n - 1) - (n - Σb)` = **`Σb - 1`**, independent of n.
 
-**Return on capital equals the edge.** With a 0.005 tick and observed edges of
-one to four ticks, that is 0.5%–2% — and it is earned *once*, because the
-position only pays at settlement on 2026-11-04. The capital does not recycle.
+Worked example, Governor of Georgia (`b_D = 0.49`, `b_R = 0.515`, `Σb = 1.005`):
+buy NO on D at 0.51 and NO on R at 0.485 for 0.995. D wins → 0 + 1 = 1. R wins →
+1 + 0 = 1. Neither → 1 + 1 = 2. Worst case 1 against a cost of 0.995, so +0.005
+locked, which is `Σb - 1`.
 
-That gives a hard ceiling. With 100,000 SUSQies, every share of paired position
-consumes ~1 SUSQie of capital, so the account can hold at most ~100,000 shares
-of dutch book at any time:
+### Return on capital
+
+The capital locked per share is the cost, `n - Σb`, which with `Σb ≈ 1` is
+**about n - 1** — so:
+
+$$\text{ROC} \approx \frac{\text{edge}}{n-1}$$
+
+For a two-leg race that is the edge itself (0.5% per tick). **For a three-leg
+race it is half that**, because the same one-tick profit requires locking ~2
+SUSQies per share instead of ~1. Montana Senate, Nebraska Senate and RI Governor
+are therefore the *least* attractive dutch books on the board, not equal ones.
+
+Either way it is earned *once*: the position only pays at settlement on
+2026-11-04, so the capital does not recycle.
+
+That gives a hard ceiling. 112 of the 115 races are two-leg, so each share of
+paired position consumes ~1 SUSQie, and 100,000 SUSQies holds at most ~100,000
+shares of dutch book at a time:
 
 $$\text{max total profit} \approx 100{,}000 \times \overline{\text{edge}} \approx 100{,}000 \times 0.005 = \mathbf{500\ \text{SUSQies}}$$
 
