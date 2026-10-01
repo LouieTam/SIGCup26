@@ -61,7 +61,7 @@ context.
 - An opposite-signed `buy` **nets against** the existing position at FIFO lot
   cost rather than opening a new one.
 
-## 3. Do resting bids lock capital? — tested: `myBalance` does NOT move
+## 3. Do resting bids lock capital? — ANSWERED: no, they do not
 
 Measured 2026-10-01 via `probe_trading.py` on exchange 1077 (market 388):
 
@@ -77,27 +77,30 @@ So a resting bid does not reduce `myBalance`, and `GET /portfolio/collateral`
 returns `{"data": []}` (it only ever reports ALL-relationship advances, and we
 have no ALL relationships — see Q9).
 
-**Caveat, and it matters.** This proves `myBalance` is unaffected; it does *not*
-prove there is no reservation. The product guide shows an "Available SUSQie
-balance" in the web portfolio, and `POST /orders` can fail `400` for
-insufficient balance — so the engine may well track an available figure that
-`myBalance` does not expose. Two readings fit the evidence:
+`myBalance` being unchanged left open whether the engine reserves against a
+hidden "available" figure that the API does not expose (the web portfolio shows
+one). Settled by a second, independent observation: with **5,000 YES @ 0.01
+resting (50 notional)**, the web UI's *available* balance still read 100K. A
+reservation would have shown ~99,950. So there is **no reservation on either
+surface** — resting bids are free.
 
-- **No reservation at all.** The ladder can be arbitrarily deep, and the engine
-  must therefore reject or cancel at *fill* time if cash runs short.
-- **Reservation against a hidden available balance.** `myBalance` is total cash,
-  and the ladder is still capped — we just can't see the cap.
+### What this means, and the risk it creates
 
-The discriminating test is to rest a bid whose notional *exceeds* the balance
-(e.g. 150,000) and see whether it is accepted. **Not run:** on a real book that
-means briefly resting an order we could not pay for, and a sweep into it during
-the few seconds before cancellation would open a position worth more than half
-the account. That's a sizing decision, not a technical one — needs a human call
-on acceptable exposure.
+The ladder is **not capped by cash**, so §5.2's "size increasing as price drops"
+can go as deep as we like. That is the single biggest enabler for Phase 1.
 
-Until it's settled, **cap total resting ladder notional at the cash balance**.
-That is correct under both readings and costs nothing if reservation turns out
-to be absent.
+But it cuts the other way too, and this is now the main operational risk:
+**nothing stops us from resting more bids than we could pay for.** If a sweep
+fills several rungs at once, the engine must either reject fills, cancel
+remaining orders, or let the balance go negative — and **we do not know which**.
+Finding out by accident during a real sweep is the worst way to learn it.
+
+So: keep a **self-imposed cap on total resting notional** (ours, enforced
+client-side, tracked across all bots on the account) even though the platform
+does not require one. Not because capital is reserved, but because the failure
+mode of over-commitment is unknown. Determining it deliberately — with a
+small deliberate over-commitment on a cheap market — is worth doing before the
+ladder scales.
 
 ## 4. Fees — answered: none
 
