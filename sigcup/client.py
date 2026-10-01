@@ -337,13 +337,15 @@ class SuperMarketClient:
         self._require_trading()
         if not 1 <= len(orders) <= 50:
             raise ValueError("batch takes 1..50 orders")
+        # BatchOrderInput has no top-level tournamentId — it belongs on each
+        # order, or the batch silently resolves to the default context.
+        scoped = [{**o, "tournamentId": o.get("tournamentId") or self.tournament_id} for o in orders]
         return self._request(
             "POST",
             "/orders/batch",
             body={
                 "idempotencyKey": idempotency_key or str(uuid.uuid4()),
-                "tournamentId": self.tournament_id,
-                "orders": orders,
+                "orders": scoped,
             },
         )
 
