@@ -31,7 +31,9 @@ import json
 import os
 import signal
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 from sigcup.catalog import load_catalog, select
@@ -53,20 +55,25 @@ def now_iso() -> str:
 
 
 class Writer:
-    """Append-only JSONL sink, flushed per record so a kill loses nothing."""
+    """Append-only JSONL sink, flushed per record so a kill loses nothing.
+    Thread-safe: the deep tier fetches markets concurrently."""
 
     def __init__(self, name: str):
         os.makedirs(DATA_DIR, exist_ok=True)
         self.path = os.path.join(DATA_DIR, f"{name}.jsonl")
         self._f = open(self.path, "a", buffering=1)
+        self._lock = threading.Lock()
         self.count = 0
 
     def write(self, rec: dict) -> None:
-        self._f.write(json.dumps(rec, separators=(",", ":")) + "\n")
-        self.count += 1
+        line = json.dumps(rec, separators=(",", ":")) + "\n"
+        with self._lock:
+            self._f.write(line)
+            self.count += 1
 
     def close(self) -> None:
-        self._f.close()
+        with self._lock:
+            self._f.close()
 
 
 def collect_wide(c: SuperMarketClient, exchange_ids: list[str], w: Writer) -> int:
@@ -91,70 +98,104 @@ def collect_deep(
     last_trade: dict[str, int],
     depth: int,
     first_pass_lookback_min: int,
+    workers: int = 6,
 ) -> tuple[int, int]:
-    """Full book + new trades for each focus market. Returns (reads, new trades)."""
+    """Full book + new trades for each focus market, fetched concurrently.
+
+    Concurrency is about latency, not throughput: this API answers in 2-17s, so
+    a sequential pass over the focus set would take most of a minute and miss
+    the sweeps we are trying to catch. The client's rate limiter is shared and
+    thread-safe, so workers still respect the one account budget.
+    """
+    totals = [0, 0]  # reads, new trades
+    tally = threading.Lock()
+    watermark = threading.Lock()
+
+    def one(row: dict) -> None:
+        reads, new_trades = _collect_one(
+            c, row, books, trades, last_trade, depth,
+            first_pass_lookback_min, watermark,
+        )
+        with tally:
+            totals[0] += reads
+            totals[1] += new_trades
+
+    with ThreadPoolExecutor(max_workers=min(workers, max(1, len(focus)))) as pool:
+        list(pool.map(one, focus))
+    return totals[0], totals[1]
+
+
+def _collect_one(
+    c: SuperMarketClient,
+    row: dict,
+    books: Writer,
+    trades: Writer,
+    last_trade: dict[str, int],
+    depth: int,
+    first_pass_lookback_min: int,
+    watermark: threading.Lock,
+) -> tuple[int, int]:
     reads = 0
     new_trades = 0
-    for row in focus:
-        mid, exid = row["marketId"], row["exchangeId"]
-        ts = now_iso()
-        try:
-            book = c.market_orderbook(mid, depth=depth)
-            reads += 1
-        except ApiError as e:
-            print(f"  [book {mid}] {e.code}: {e.message}", flush=True)
-            continue
-        for ex in book.get("exchanges") or []:
-            books.write(
-                {
-                    "ts": ts,
-                    "marketId": mid,
-                    "exchangeId": ex["exchangeId"],
-                    "asOf": ex.get("asOf"),
-                    "impliedProbability": ex.get("impliedProbability"),
-                    "bids": ex.get("bids"),
-                    "asks": ex.get("asks"),
-                }
-            )
+    mid, exid = row["marketId"], row["exchangeId"]
+    ts = now_iso()
 
-        # Trade tape. On the first pass look back a window; after that only ask
-        # for prints newer than the last id we stored.
-        params: dict = {}
-        if exid not in last_trade and first_pass_lookback_min > 0:
-            start = time.time() - first_pass_lookback_min * 60
-            params["from"] = datetime.fromtimestamp(start, timezone.utc).isoformat()
-        try:
-            tape = c._get(
-                f"/exchanges/{exid}/trades",
-                tournamentId=c.tournament_id,
-                limit=200,
-                **params,
-            )
-            reads += 1
-        except ApiError as e:
-            print(f"  [tape {exid}] {e.code}: {e.message}", flush=True)
-            continue
+    try:
+        book = c.market_orderbook(mid, depth=depth)
+        reads += 1
+    except ApiError as e:
+        print(f"  [book {mid}] {e.code}: {e.message}", flush=True)
+        return reads, new_trades
 
+    for ex in book.get("exchanges") or []:
+        books.write(
+            {
+                "ts": ts,
+                "marketId": mid,
+                "exchangeId": ex["exchangeId"],
+                "asOf": ex.get("asOf"),
+                "impliedProbability": ex.get("impliedProbability"),
+                "bids": ex.get("bids"),
+                "asks": ex.get("asks"),
+            }
+        )
+
+    # Trade tape. On the first pass look back a window; after that ask only for
+    # prints newer than the watermark we stored for this exchange.
+    params: dict = {}
+    with watermark:
+        first_pass = exid not in last_trade
+    if first_pass and first_pass_lookback_min > 0:
+        start = time.time() - first_pass_lookback_min * 60
+        params["from"] = datetime.fromtimestamp(start, timezone.utc).isoformat()
+
+    try:
+        tape = c._get(
+            f"/exchanges/{exid}/trades",
+            tournamentId=c.tournament_id,
+            limit=200,
+            **params,
+        )
+        reads += 1
+    except ApiError as e:
+        print(f"  [tape {exid}] {e.code}: {e.message}", flush=True)
+        return reads, new_trades
+
+    with watermark:
         seen = last_trade.get(exid, -1)
-        high = seen
-        for t in tape.get("data") or []:
-            try:
-                tid = int(t["id"])
-            except (TypeError, ValueError):
-                tid = -1  # legacy id space; store it, don't use it as a watermark
-            if tid > seen or tid < 0:
-                trades.write(
-                    {
-                        "ts": ts,
-                        "marketId": mid,
-                        "exchangeId": exid,
-                        "trade": t,
-                    }
-                )
-                new_trades += 1
-            high = max(high, tid)
-        if high >= 0:
-            last_trade[exid] = high
+    high = seen
+    for t in tape.get("data") or []:
+        try:
+            tid = int(t["id"])
+        except (TypeError, ValueError):
+            tid = -1  # legacy id space; store it, but never use it as a watermark
+        if tid > seen or tid < 0:
+            trades.write({"ts": ts, "marketId": mid, "exchangeId": exid, "trade": t})
+            new_trades += 1
+        high = max(high, tid)
+    if high >= 0:
+        with watermark:
+            last_trade[exid] = max(last_trade.get(exid, -1), high)
     return reads, new_trades
 
 
