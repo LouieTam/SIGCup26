@@ -126,6 +126,16 @@ def estimate_fair(leg: Leg, siblings: list[Leg]) -> tuple[float | None, float]:
     return (leg.mid + implied) / 2, gap
 
 
+def quantize_fair(fair: float, grid: float = 0.02) -> float:
+    """Snap fair onto a coarse grid so small book wobble does not move the rungs.
+
+    Without this, fair is recomputed every pass, a one-tick drift shifts every
+    rung, and the ladder is torn down and re-posted continuously — which at ~25
+    races would exceed the 30 writes/min budget on its own.
+    """
+    return round(round(fair / grid) * grid, 4)
+
+
 def build_ladder(
     leg: Leg,
     fair: float,
@@ -137,6 +147,7 @@ def build_ladder(
     rungs = rungs or DEFAULT_RUNGS
     if leg.best_bid is None:
         return []
+    fair = quantize_fair(fair)
     ceiling = round_to_tick(leg.best_bid - TICK)  # never cross, never join the touch
 
     priced: list[tuple[float, float]] = []
@@ -250,23 +261,41 @@ def current_ladder(c: SuperMarketClient) -> dict[str, list[dict]]:
     return out
 
 
-def ladder_matches(desired: list[Quote], resting: list[dict], tol_qty: float = 0.10) -> bool:
-    """True if what rests already matches the plan, so we can skip the writes.
+def ladder_matches(
+    desired: list[Quote],
+    resting: list[dict],
+    tol_qty: float = 0.25,
+    tol_ticks: int = 3,
+) -> bool:
+    """True if what rests is close enough to the plan to leave alone.
 
-    Quantity is compared with tolerance because the engine shrinks resting
-    orders to fit a reduced balance — a shrunken rung is not a reason to churn
-    the whole ladder, but a missing or mispriced one is.
+    Deliberately tolerant, because re-posting costs 2 writes against a 30/min
+    budget and a torn-down ladder is not resting when a sweep arrives:
+
+    * price within `tol_ticks` — fair value wobbles continuously and a rung one
+      tick off is worth just as much.
+    * quantity shrunk by up to `tol_qty` — the engine shrinks resting orders to
+      fit a reduced balance, which is not drift we should fight.
+
+    A missing rung, an extra one, or a materially mispriced one does trigger a
+    re-post.
     """
     if len(desired) != len(resting):
         return False
-    rest_by_price = {round(float(o["priceLimit"] or -1), 3): o for o in resting}
+    tol = tol_ticks * TICK + 1e-9
+    unmatched = list(resting)
     for q in desired:
-        o = rest_by_price.get(round(q.price, 3))
-        if o is None:
+        hit = None
+        for o in unmatched:
+            p = o.get("priceLimit")
+            if p is None:
+                continue
+            if abs(float(p) - q.price) <= tol and float(o["quantity"]) >= q.quantity * (1 - tol_qty):
+                hit = o
+                break
+        if hit is None:
             return False
-        have = float(o["quantity"])
-        if have < q.quantity * (1 - tol_qty):
-            return False
+        unmatched.remove(hit)
     return True
 
 
