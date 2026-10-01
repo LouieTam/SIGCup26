@@ -37,12 +37,22 @@ from .client import TICK, SuperMarketClient, round_to_tick
 # 0.60 rung outright, and the deepest rungs had the best return on capital.
 DEFAULT_RUNGS: list[tuple[float, float]] = [
     # (fraction of fair, size weight)
-    (0.88, 1.0),
-    (0.75, 1.5),
-    (0.60, 2.5),
-    (0.45, 4.0),
-    (0.33, 6.0),
-    (0.25, 8.0),
+    #
+    # Dense through the shallow end on purpose. The first version jumped from
+    # 0.88 to 0.75 of fair, and a real sweep on NJ Senate D reached only 0.80 of
+    # fair (0.78 against a 0.97 contract) — it would have landed in that gap and
+    # filled just the 101-share top rung. Observed sweep depths range from 0.80
+    # of fair down to 0.016, so the ladder has to span that whole range rather
+    # than cluster at the catastrophic end.
+    (0.95, 1.0),
+    (0.90, 1.2),
+    (0.85, 1.5),
+    (0.78, 2.0),
+    (0.70, 2.5),
+    (0.60, 3.0),
+    (0.48, 4.0),
+    (0.36, 5.0),
+    (0.25, 6.0),
 ]
 
 
@@ -300,16 +310,25 @@ def ladder_matches(
 
 
 def apply_plan(
-    c: SuperMarketClient, plans: list[RacePlan], live: bool, verbose: bool = True
+    c: SuperMarketClient,
+    plans: list[RacePlan],
+    live: bool,
+    verbose: bool = True,
+    shrink_tol: float = 0.25,
 ) -> dict:
-    """Re-post ladders that have drifted. 2 writes per changed exchange."""
+    """Re-post ladders that have drifted. 2 writes per changed exchange.
+
+    `shrink_tol` must be generous when overbooked: the engine shrinks resting
+    orders to fit available cash, and treating its rationing as "drift" would
+    re-post every ladder every pass and blow the 30 writes/min budget.
+    """
     resting = current_ladder(c) if live else {}
     writes = placed = skipped_same = 0
     for p in plans:
         if not p.quotes:
             continue
         exid = p.leg.exchange_id
-        if live and ladder_matches(p.quotes, resting.get(exid, [])):
+        if live and ladder_matches(p.quotes, resting.get(exid, []), tol_qty=shrink_tol):
             skipped_same += 1
             continue
         if not live:

@@ -142,6 +142,9 @@ def main() -> int:
     ap.add_argument("--cash-floor-pct", type=float, default=0.25,
                     help="hard stop: cancel everything if cash falls below this "
                          "fraction of the starting balance (default 0.25)")
+    ap.add_argument("--shrink-tol", type=float, default=0.25,
+                    help="fraction a resting rung may be shrunk by the engine before "
+                         "we re-post it; set high when overbooked (default 0.25)")
     ap.add_argument("--log", default="data/quoter.jsonl", help="per-pass state log")
     args = ap.parse_args()
     if args.max_deploy_pct is None:
@@ -217,7 +220,7 @@ def main() -> int:
                     per_race_pct=args.race_pct,
                 )
                 show(plans, stats, args.live)
-                res = apply_plan(c, plans, live=args.live)
+                res = apply_plan(c, plans, live=args.live, shrink_tol=args.shrink_tol)
 
             if args.unwind and npass % args.unwind_every == 0:
                 unwind(c, args.live)
