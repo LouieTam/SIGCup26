@@ -29,8 +29,9 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
+from typing import Callable
 
-from .client import TICK, SuperMarketClient, round_to_tick
+from .client import TICK, ApiError, SuperMarketClient, round_to_tick
 
 # Rung depth as a fraction of fair value, with relative size weights.
 # Depth matters more than tightness: in the Alaska sweep the 0.30 rung beat the
@@ -86,6 +87,7 @@ class Quote:
     market_id: str
     price: float
     quantity: int
+    side: str = "yes"  # "no" for mirror rungs; price is then a NO price
 
     @property
     def notional(self) -> float:
@@ -94,7 +96,7 @@ class Quote:
     def to_order(self) -> dict:
         return {
             "exchangeId": self.exchange_id,
-            "side": "yes",
+            "side": self.side,
             "action": "buy",
             "quantity": self.quantity,
             "price": self.price,
@@ -110,6 +112,7 @@ class RacePlan:
     coherence: float
     quotes: list[Quote] = field(default_factory=list)
     skipped: str | None = None
+    mirror: bool = False  # NO bids on a longshot leg; `fair` is then the NO fair
 
     @property
     def notional(self) -> float:
@@ -196,6 +199,30 @@ def build_ladder(
     return quotes
 
 
+def build_mirror_ladder(
+    leg: Leg,
+    yes_fair: float,
+    race_notional: float,
+    rungs: list[tuple[float, float]] = None,
+) -> list[Quote]:
+    """NO bids on a longshot leg: the mirror of build_ladder.
+
+    Catches someone aggressively BUYING the longshot (an up-sweep), which
+    analyze_mirror.py measured as larger flow than favourite dumps. A NO bid at
+    q is a YES offer at 1 - q, and the best NO bid is 1 - best YES ask, so the
+    same never-cross rule applies in NO terms: every rung strictly below
+    1 - bestAsk, i.e. every YES-equivalent offer strictly above the best ask.
+    """
+    if leg.best_ask is None:
+        return []
+    shadow = Leg(leg.market_id, leg.exchange_id, leg.winner, leg.race_id, leg.race_name,
+                 best_bid=round_to_tick(1 - leg.best_ask))
+    quotes = build_ladder(shadow, 1 - yes_fair, race_notional, rungs)
+    for q in quotes:
+        q.side = "no"
+    return quotes
+
+
 def plan_races(
     c: SuperMarketClient,
     races: dict[str, list[dict]],
@@ -205,8 +232,15 @@ def plan_races(
     total_budget_pct: float = 0.50,
     per_race_pct: float = 0.10,
     rungs: list[tuple[float, float]] = None,
+    mirror_frac: float = 0.0,
 ) -> tuple[list[RacePlan], dict]:
-    """Decide what to rest, for which races, inside the exposure caps."""
+    """Decide what to rest, for which races, inside the exposure caps.
+
+    `mirror_frac` > 0 adds a mirror ladder (NO bids) on each longshot leg of
+    every race whose favourite is quoted, sized at `mirror_frac` of the race
+    budget split across the longshots. Both ladders pay if the favourite wins,
+    so they are one bet on the race, not two.
+    """
     legs_by_race: dict[str, list[Leg]] = {}
     all_legs: list[Leg] = []
     for rid, rows in races.items():
@@ -253,6 +287,19 @@ def plan_races(
                 plan.skipped = "no rung fits below the best bid"
         plans.append(plan)
 
+        if mirror_frac > 0 and plan.skipped is None:
+            longshots = [l for l in legs if l is not leg]
+            for ls in longshots:
+                ls_fair, _ = estimate_fair(ls, [l for l in legs if l is not ls])
+                if ls_fair is None:
+                    continue
+                m = RacePlan(rid, ls.race_name, ls, round(1 - ls_fair, 4), gap, mirror=True)
+                m.quotes = build_mirror_ladder(
+                    ls, ls_fair, race_budget * mirror_frac / len(longshots), rungs)
+                if not m.quotes:
+                    m.skipped = "no mirror rung fits above the best ask"
+                plans.append(m)
+
     # Global governor: admit races by descending fair until the budget is spent.
     admitted = sorted([p for p in plans if p.quotes], key=lambda p: -p.fair)
     running = 0.0
@@ -268,8 +315,9 @@ def plan_races(
         "total_budget": total_budget,
         "race_budget": race_budget,
         "committed": running,
-        "races_quoted": sum(1 for p in plans if p.quotes),
-        "races_skipped": sum(1 for p in plans if not p.quotes),
+        "races_quoted": sum(1 for p in plans if p.quotes and not p.mirror),
+        "races_skipped": sum(1 for p in plans if not p.quotes and not p.mirror),
+        "mirrors_quoted": sum(1 for p in plans if p.quotes and p.mirror),
     }
     return plans, stats
 
@@ -327,12 +375,22 @@ def apply_plan(
     live: bool,
     verbose: bool = True,
     shrink_tol: float = 0.25,
+    after_write: Callable[[], None] | None = None,
+    held: Callable[[], set[str]] | None = None,
 ) -> dict:
     """Re-post ladders that have drifted. 2 writes per changed exchange.
 
     `shrink_tol` must be generous when overbooked: the engine shrinks resting
     orders to fit available cash, and treating its rationing as "drift" would
     re-post every ladder every pass and blow the 30 writes/min budget.
+
+    Ladder writes go out low-priority (they leave write slots free for exits),
+    and `after_write` runs after each exchange is posted so fills that land
+    mid-pass get an exit straight away instead of waiting for the exit thread.
+
+    `held()` returns exchanges we hold a position on. Those may carry an exit
+    sell, which cancel_all would wipe along with the ladder, so there we cancel
+    the old rungs by id instead (one write per rung rather than one in total).
     """
     resting = current_ladder(c) if live else {}
     writes = placed = skipped_same = 0
@@ -346,16 +404,30 @@ def apply_plan(
         if not live:
             placed += len(p.quotes)
             continue
-        if resting.get(exid):
-            c.cancel_all(exchange_id=exid)
+        c.low_priority.on = True
+        try:
+            if resting.get(exid) and held and exid in held():
+                for o in resting[exid]:
+                    try:
+                        c.cancel(str(o["id"]))
+                    except ApiError as e:
+                        # Already filled or cancelled; nothing left to remove.
+                        print(f"    cancel {o['id']}: {e.code}")
+                    writes += 1
+            elif resting.get(exid):
+                c.cancel_all(exchange_id=exid)
+                writes += 1
+            key = f"ladder-{exid}-{uuid.uuid4()}"
+            res = c.place_batch([q.to_order() for q in p.quotes], idempotency_key=key)
             writes += 1
-        key = f"ladder-{exid}-{uuid.uuid4()}"
-        res = c.place_batch([q.to_order() for q in p.quotes], idempotency_key=key)
-        writes += 1
+        finally:
+            c.low_priority.on = False
         results = res.get("results") or res.get("data") or []
         ok = sum(1 for r in results if str(r.get("status", "")).startswith("2")) or len(p.quotes)
         placed += ok
         if verbose:
             print(f"    posted {len(p.quotes)} rungs on ex {exid} "
                   f"({p.notional:,.0f} notional), writes used {writes}")
+        if after_write:
+            after_write()
     return {"writes": writes, "placed": placed, "unchanged": skipped_same}

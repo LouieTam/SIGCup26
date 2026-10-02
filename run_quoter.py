@@ -39,13 +39,15 @@ def _sig(signum, frame):
 def show(plans, stats, live: bool) -> None:
     print(f"\ncash {stats['cash']:,.2f} | global cap {stats['total_budget']:,.0f} "
           f"({stats['total_budget'] / stats['cash'] * 100:.0f}%) | per-race cap {stats['race_budget']:,.0f}")
-    print(f"quoting {stats['races_quoted']} races, skipping {stats['races_skipped']}, "
+    print(f"quoting {stats['races_quoted']} races (+{stats.get('mirrors_quoted', 0)} mirror legs), "
+          f"skipping {stats['races_skipped']}, "
           f"committing {stats['committed']:,.0f} notional\n")
 
     quoted = [p for p in plans if p.quotes]
     for p in sorted(quoted, key=lambda p: -p.fair):
-        print(f"  {p.race_name}  [{p.leg.winner}]  fair {p.fair:.3f} "
-              f"(coherence gap {p.coherence:.3f}, bestBid {p.leg.best_bid})")
+        tag = f"MIRROR NO on [{p.leg.winner}]" if p.mirror else f"[{p.leg.winner}]"
+        print(f"  {p.race_name}  {tag}  fair {p.fair:.3f} "
+              f"(coherence gap {p.coherence:.3f}, YES bid/ask {p.leg.best_bid}/{p.leg.best_ask})")
         for q in p.quotes:
             pct = q.price / p.fair * 100
             print(f"      bid {q.price:<6} x {q.quantity:>7,} sh = {q.notional:>9,.0f} "
@@ -53,7 +55,7 @@ def show(plans, stats, live: bool) -> None:
                   f"{(p.fair - q.price) * q.quantity:>9,.0f}")
         print(f"      race notional {p.notional:>,.0f}\n")
 
-    skipped = [p for p in plans if not p.quotes]
+    skipped = [p for p in plans if not p.quotes and not p.mirror]
     if skipped:
         print(f"  skipped ({len(skipped)}):")
         for p in sorted(skipped, key=lambda p: -(p.fair or 0))[:14]:
@@ -65,11 +67,78 @@ def show(plans, stats, live: bool) -> None:
         print("\nDRY RUN — nothing was placed. Add --live to post these.")
 
 
+# orderId -> (action, side). Order direction never changes, so this is cached for
+# the life of the process; most ids arrive free from open_orders reads.
+_order_dir: dict[int, tuple[str, str]] = {}
+
+
+def _remember(orders: list[dict]) -> None:
+    for o in orders:
+        _order_dir[o["id"]] = (o["action"], o["side"])
+
+
+def pos_side(p: dict) -> str:
+    """"yes" or "no": which side's shares this position holds. Exits must sell
+    that side. Selling the OTHER side is canonicalized into a buy of this one,
+    which grows the position instead of closing it.
+
+    The API reports a NO holding as `option: "YES"` with a NEGATIVE quantity
+    (lots carry side "NO"; avgCost is in NO terms). Verified on the first live
+    mirror fill, ex991, 2026-10-02. So the sign decides, not `option`.
+    """
+    if str(p.get("option") or "").upper() == "NO":
+        return "no"
+    return "no" if int(p["quantity"]) < 0 else "yes"
+
+
+def fills_net(c: SuperMarketClient, exid: str) -> int:
+    """Net YES shares held on `exid`, summed from the fills ledger.
+
+    An independent second source for the position, because the positions
+    endpoint lags fills. Fills carry no direction, so each fill's order is
+    looked up (cached). A sell the engine canonicalized into a complement NO buy
+    shows up as side "no" with a negative quantity; a NO buy always reduces YES,
+    so magnitudes are used and the sign comes from action x side.
+    """
+    net = 0
+    for f in c.fills(exchange_id=exid):
+        oid = f["orderId"]
+        if oid not in _order_dir:
+            o = c.order(str(oid))
+            o = o.get("data", o)
+            _order_dir[oid] = (o["action"], o["side"])
+        action, _ = _order_dir[oid]
+        q = abs(int(f["quantity"]))
+        sign = 1 if action == "buy" else -1
+        net += sign * q if f["side"] == "yes" else -sign * q
+    return net
+
+
+def held_qty(c: SuperMarketClient, exid: str, side: str = "yes") -> tuple[int, int, int]:
+    """(held, positions qty, fills-ledger qty) of `side` shares. `held` is the
+    smaller of the two: either source running stale-high is what oversells us
+    into the opposite side, so only a reading BOTH agree on is trusted."""
+    pos = next((abs(int(p["quantity"])) for p in c.positions()
+                if str(p["exchangeId"]) == exid and pos_side(p) == side), 0)
+    net_yes = fills_net(c, exid)
+    led = net_yes if side == "yes" else -net_yes
+    return max(0, min(pos, led)), pos, led
+
+
+def resting_sells(c: SuperMarketClient, exid: str, side: str = "yes") -> list[dict]:
+    orders = c.open_orders(exchangeId=exid)
+    _remember(orders)
+    return [o for o in orders
+            if o.get("open") and o.get("action") == "sell" and o.get("side") == side
+            and str(o["exchangeId"]) == exid]
+
+
 def unwind(
     c: SuperMarketClient,
     live: bool,
     min_edge: float = 0.005,
     reprice_ticks: int = 2,
+    min_topup: int = 10,
 ) -> None:
     """Exit by improving the offer: post a YES sell one tick inside the best ask.
 
@@ -92,28 +161,41 @@ def unwind(
     at cost is what actually matters: it guarantees we never realise a loss. When
     the floor sits above the ask (a position that moved against us) the order rests
     above the market as free optionality on a rally rather than selling at a loss.
+
+    Sizing (this replaced a "never top up" rule that left ladder fills landing on
+    an already-covered exchange with no exit until the next reprice):
+
+        uncovered = held - resting sells
+
+    where `held` is min(positions endpoint, fills ledger) — see held_qty(). Read
+    ORDER matters: resting sells are read BEFORE holdings. If an exit fills in
+    between, `resting` is stale high and `held` is current, so the error
+    under-covers (safe). The reverse order would over-cover by exactly that fill
+    and flip us short, which is the ex1059 failure. After any reprice cancel,
+    both are re-read in that order before posting.
     """
     print("\n=== unwind pass ===")
-    pos = [p for p in c.positions() if p["quantity"] > 0]
-    if not pos:
-        print("  no long positions")
+    # Each position is exited on its own side: YES holdings (main ladder) by a
+    # YES sell, NO holdings (mirror ladder) by a NO sell. Everything below is in
+    # that side's price terms.
+    candidates = {(str(p["exchangeId"]), pos_side(p)): p for p in c.positions()
+                  if abs(p["quantity"]) > 0}
+    if not candidates:
+        print("  no positions")
         return
 
-    sells: dict[str, list[dict]] = {}
-    for o in c.open_orders():
-        if o.get("open") and o.get("action") == "sell":
-            sells.setdefault(str(o["exchangeId"]), []).append(o)
-
-    for p in pos:
-        exid = str(p["exchangeId"])
-        qty = int(p["quantity"])
-        if qty <= 0:
-            continue
+    for (exid, side), p in candidates.items():
         avg = p["avgCost"]
         book = c.exchange_orderbook(exid, depth=5)
-        bid, ask = book.get("bestBid"), book.get("bestAsk")
+        ybid, yask = book.get("bestBid"), book.get("bestAsk")
+        if side == "yes":
+            bid, ask = ybid, yask
+        else:  # NO bid = 1 - YES ask, NO ask = 1 - YES bid
+            bid = round_to_tick(1 - yask) if yask is not None else None
+            ask = round_to_tick(1 - ybid) if ybid is not None else None
+        label = exid if side == "yes" else f"{exid}/NO"
         if ask is None:
-            print(f"  ex {exid}: no offer side, skipping")
+            print(f"  ex {label}: no offer side, skipping")
             continue
         fair = ((bid + ask) / 2) if bid is not None else ask
 
@@ -122,47 +204,79 @@ def unwind(
         target = max(improve, floor)
         crosses = bid is not None and target <= bid
 
-        existing = sells.get(exid, [])
-        resting = sum(int(o["quantity"]) for o in existing)
+        # 1. Sells first, then holdings (see docstring).
+        existing = resting_sells(c, exid, side)
         # Re-price stale exits. Cancel by order id, never cancel-all — that would
         # also wipe the sweep ladder resting on the same exchange.
         stale = [o for o in existing
                  if o.get("priceLimit") is not None
                  and abs(float(o["priceLimit"]) - target) > reprice_ticks * TICK]
         if stale:
-            print(f"  ex {exid}: repricing {len(stale)} stale exit(s) "
+            print(f"  ex {label}: repricing {len(stale)} stale exit(s) "
                   f"{[o['priceLimit'] for o in stale]} -> {target}")
-            for o in stale:
-                if live:
+            if not live:
+                existing = [o for o in existing if o not in stale]
+            else:
+                for o in stale:
                     try:
                         c.cancel(str(o["id"]))
-                        resting -= int(o["quantity"])
                     except ApiError as e:
                         print(f"    cancel {o['id']}: {e.code}")
-                else:
-                    resting -= int(o["quantity"])
+                # Fills may have landed up to the moment of cancel: re-read.
+                existing = resting_sells(c, exid, side)
+        resting = sum(int(o["quantity"]) for o in existing)
 
-        # Only ever ONE resting sell per exchange, sized from a fresh position read.
-        # Never top up: `qty` can be stale high (positions lag fills), so qty-resting
-        # overstates the remainder and the extra sell flips us short.
-        if resting > 0:
-            print(f"  ex {exid}: {resting:,} already offered of {qty:,} — "
-                  f"not topping up (positions lag fills)")
+        # 2. Holdings, read after the sells.
+        held, pos_q, led_q = held_qty(c, exid, side)
+        uncovered = held - resting
+        if pos_q != led_q:
+            print(f"  ex {label}: positions {pos_q:,} vs fills ledger {led_q:,} disagree "
+                  f"— using {held:,}")
+        if uncovered < 0:
+            if max(pos_q, led_q) >= resting:
+                # Only one source reads low; most likely it is lagging a buy.
+                print(f"  ex {label}: offered {resting:,}, sources read {pos_q:,}/{led_q:,}"
+                      f" — waiting for them to agree")
+                continue
+            # The usual cause is benign: an exit filled between the sells read and
+            # the holdings read (by design that order errs this way). Re-read the
+            # sells; a fill now lowers `resting`, so only a real over-offer survives.
+            # (False alarm seen live on ex870, 2026-10-02 18:55Z: 579 shares sold
+            # between the reads, and the old code cancelled a working exit.)
+            existing = resting_sells(c, exid, side)
+            resting = sum(int(o["quantity"]) for o in existing)
+            if resting <= held:
+                print(f"  ex {label}: offer {resting:,} vs held {held:,} after re-read; "
+                      f"an exit was filling mid-read, nothing to do")
+                continue
+            # Both agree we offered more than we hold. The excess would be
+            # canonicalized into a buy of the other side if it filled, so pull the
+            # exits; the next pass re-posts at the right size.
+            print(f"  ex {label}: OVER-OFFERED {resting:,} vs held {held:,}; cancelling exits")
+            if live:
+                for o in existing:
+                    try:
+                        c.cancel(str(o["id"]))
+                    except ApiError as e:
+                        print(f"    cancel {o['id']}: {e.code}")
             continue
-        uncovered = qty
+        if uncovered == 0:
+            print(f"  ex {label}: {held:,} held, fully offered")
+            continue
+        if resting > 0 and uncovered < min_topup:
+            print(f"  ex {label}: {uncovered:,} uncovered below top-up minimum {min_topup}; "
+                  f"leaving for the next reprice")
+            continue
+
         tag = "CROSSES now" if crosses else "rests as best offer"
         if target > ask:
             tag = "rests ABOVE market (optionality; floor is above the ask)"
-        print(f"  ex {exid} qty {qty:,} avg {avg:.3f} bid {bid} ask {ask} fair {fair:.3f}"
-              f" -> offer {target} ({tag}), uncovered {uncovered:,}, "
-              f"edge {(target-avg)*max(uncovered,0):+,.0f}")
-        if uncovered <= 0:
-            continue
-        if target < floor:
-            print(f"    skipped: {target} below cost floor {floor}")
-            continue
+        kind = f"TOP-UP ({resting:,} already offered)" if resting else "exit"
+        print(f"  ex {label} held {held:,} avg {avg:.3f} bid {bid} ask {ask} fair {fair:.3f}"
+              f" -> {kind} {uncovered:,} @ {target} ({tag}), "
+              f"edge {(target - avg) * uncovered:+,.0f}")
         if live:
-            r = c.place_order(exid, "yes", "sell", uncovered, target)
+            r = c.place_order(exid, side, "sell", uncovered, target)
             print(f"    placed: traded {r.get('quantityTraded') or 0:,} @ "
                   f"{r.get('fillPrice')} open={r.get('open')} "
                   f"terminalReasonCode={r.get('terminalReasonCode')}")
@@ -200,6 +314,10 @@ def main() -> int:
                     help="minimum profit per share required to post an exit (default one tick)")
     ap.add_argument("--reprice-ticks", type=int, default=2,
                     help="re-price a resting exit once it drifts this many ticks from target")
+    ap.add_argument("--mirror", type=float, default=0.0,
+                    help="also rest NO bids on each quoted race's longshot legs, sized at "
+                         "this fraction of the race budget (0 = off; see "
+                         "docs/mirror-and-arb-recheck.md)")
     ap.add_argument("--shrink-tol", type=float, default=0.25,
                     help="fraction a resting rung may be shrunk by the engine before "
                          "we re-post it; set high when overbooked (default 0.25)")
@@ -239,13 +357,38 @@ def main() -> int:
     # only run hourly — far too slow when a swept fill reverts in ~75s. Exits are
     # cheap (a dozen reads, a few writes) and the two paths touch disjoint orders:
     # exits are sells cancelled by id, ladders are buys.
-    def exit_loop() -> None:
-        while not _stop:
-            try:
+    #
+    # The ladder phase also calls rearm() after every exchange it posts, so a fill
+    # landing mid-pass gets its exit within seconds rather than up to
+    # --unwind-interval later. The lock is essential: two concurrent unwinds can
+    # both see the same uncovered position, both post a sell, and flip us short.
+    unwind_lock = threading.Lock()
+    # Replaced wholesale (never mutated) so the ladder thread can read it unlocked.
+    last_seen: dict[str, int] = {}
+
+    def rearm(force: bool = False) -> None:
+        nonlocal last_seen
+        # Non-blocking: if the other thread is mid-unwind it will cover the fill.
+        if not unwind_lock.acquire(blocking=False):
+            return
+        try:
+            snap = {f'{p["exchangeId"]}/{pos_side(p)}': abs(int(p["quantity"]))
+                    for p in c.positions() if abs(p["quantity"]) > 0}
+            grew = [x for x, q in snap.items() if q > last_seen.get(x, 0)]
+            if force or grew:
+                if grew and not force:
+                    print(f"[rearm] new fills on {grew}; posting exits", flush=True)
                 unwind(c, args.live, min_edge=args.min_exit_edge,
                        reprice_ticks=args.reprice_ticks)
-            except (ApiError, OSError) as e:
-                print(f"[exits] failed: {type(e).__name__}: {e}", flush=True)
+            last_seen = snap
+        except (ApiError, OSError) as e:
+            print(f"[exits] failed: {type(e).__name__}: {e}", flush=True)
+        finally:
+            unwind_lock.release()
+
+    def exit_loop() -> None:
+        while not _stop:
+            rearm(force=True)
             for _ in range(int(max(1.0, args.unwind_interval))):
                 if _stop:
                     return
@@ -297,9 +440,12 @@ def main() -> int:
                     max_coherence_gap=args.coherence,
                     total_budget_pct=args.budget_pct,
                     per_race_pct=args.race_pct,
+                    mirror_frac=args.mirror,
                 )
                 show(plans, stats, args.live)
-                res = apply_plan(c, plans, live=args.live, shrink_tol=args.shrink_tol)
+                res = apply_plan(c, plans, live=args.live, shrink_tol=args.shrink_tol,
+                                 after_write=rearm if args.unwind else None,
+                                 held=(lambda: {k.split("/")[0] for k in last_seen}) if args.unwind else None)
 
             open_orders = len(c.open_orders())
             print(f"\npass {npass}: {res['placed']} rungs, {res['writes']} writes, "

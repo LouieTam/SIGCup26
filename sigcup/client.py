@@ -33,6 +33,8 @@ DEFAULT_BASE_URL = "https://sig.thesuper.market/api/v1"
 # Per-account per-minute budget for a standard (non-DMM) account.
 READ_BUDGET = 100
 WRITE_BUDGET = 30
+# Write slots per minute that low-priority (ladder) writes leave free for exits.
+WRITE_RESERVE = 4
 
 RETRY_CODES = {
     "RATE_LIMITED",
@@ -91,16 +93,19 @@ class _Budget:
         self._events: deque[float] = deque()
         self._lock = threading.Lock()
 
-    def acquire(self) -> None:
+    def acquire(self, reserve: int = 0) -> None:
+        """`reserve` slots are left free for other callers: a low-priority caller
+        waits until the window has more than `reserve` slots spare."""
         while True:
             with self._lock:
                 now = time.monotonic()
                 while self._events and now - self._events[0] >= self.window:
                     self._events.popleft()
-                if len(self._events) < self.limit:
+                if len(self._events) < self.limit - reserve:
                     self._events.append(now)
                     return
-                wait = self.window - (now - self._events[0]) + 0.01
+                # Can't index _events[0] if reserve alone blocks an empty window.
+                wait = (self.window - (now - self._events[0]) + 0.01) if self._events else 0.25
             time.sleep(wait)
 
 
@@ -125,6 +130,9 @@ class SuperMarketClient:
         self._ssl = _ssl_context()
         self._reads = _Budget(READ_BUDGET)
         self._writes = _Budget(WRITE_BUDGET, headroom=2)
+        # Per-thread flag: writes made while `low_priority.on` is set leave
+        # WRITE_RESERVE slots free, so exits never queue behind ladder posts.
+        self.low_priority = threading.local()
         self._tournament_id: str | None = None
 
     # ---------------------------------------------------------------- plumbing
@@ -140,7 +148,11 @@ class SuperMarketClient:
 
         last: Exception | None = None
         for attempt in range(self.max_retries + 1):
-            (self._reads if is_read else self._writes).acquire()
+            if is_read:
+                self._reads.acquire()
+            else:
+                low = getattr(self.low_priority, "on", False)
+                self._writes.acquire(reserve=WRITE_RESERVE if low else 0)
             req = urllib.request.Request(url, data=payload, method=method)
             req.add_header("Authorization", f"Bearer {self.api_key}")
             req.add_header("Accept", "application/json")
@@ -270,8 +282,12 @@ class SuperMarketClient:
     def pnl(self, slug: str | None = None) -> dict:
         return self._get(f"/tournaments/{slug or self.tournament_slug}/portfolio/pnl")
 
-    def fills(self, slug: str | None = None, limit: int = 100) -> list[dict]:
-        return list(self._paged(f"/tournaments/{slug or self.tournament_slug}/portfolio/fills", limit=limit))
+    def fills(self, slug: str | None = None, limit: int = 100,
+              exchange_id: str | None = None) -> list[dict]:
+        """Newest first. NB: fills of a sell that the engine canonicalized into a
+        complement NO buy carry side "no" and a NEGATIVE quantity."""
+        return list(self._paged(f"/tournaments/{slug or self.tournament_slug}/portfolio/fills",
+                                limit=limit, exchangeId=exchange_id))
 
     def open_orders(self, **params) -> list[dict]:
         return list(self._paged("/orders", tournamentId=self.tournament_id, **params))
