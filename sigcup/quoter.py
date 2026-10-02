@@ -44,15 +44,27 @@ DEFAULT_RUNGS: list[tuple[float, float]] = [
     # filled just the 101-share top rung. Observed sweep depths range from 0.80
     # of fair down to 0.016, so the ladder has to span that whole range rather
     # than cluster at the catastrophic end.
-    (0.95, 1.0),
-    (0.90, 1.2),
-    (0.85, 1.5),
-    (0.78, 2.0),
-    (0.70, 2.5),
-    (0.60, 3.0),
-    (0.48, 4.0),
-    (0.36, 5.0),
-    (0.25, 6.0),
+    #
+    # Reweighted from measurement, not intuition (analyze_depth.py over 20
+    # fair>=0.90 markets, full history since the open):
+    #     0.95 of fair -> 2.33% ROC, filled in 10/20 markets
+    #     0.90 of fair -> 4.37% ROC, filled in  8/20   <- best
+    #     0.85 of fair -> 3.58% ROC, filled in  7/20
+    #     0.78 and below -> NOTHING traded there, in any of the 20
+    # Deep rungs are dead capital in high-fair races: their books are tight and
+    # their flow is shallow. The violent sweeps live in mid-probability and
+    # chamber markets, which this quoter does not currently cover.
+    (0.95, 2.0),
+    (0.92, 3.0),
+    (0.90, 4.0),
+    (0.87, 3.0),
+    (0.84, 2.0),
+    # Kept small as tail insurance only. Resting costs no capital, so a lottery
+    # ticket on an Alaska-scale dislocation is nearly free — but it must not
+    # absorb size that the 0.84-0.95 band has demonstrably earned.
+    (0.70, 0.4),
+    (0.45, 0.3),
+    (0.25, 0.3),
 ]
 
 
