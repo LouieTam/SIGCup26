@@ -64,7 +64,33 @@ def show(plans, stats, live: bool) -> None:
         print("\nDRY RUN — nothing was placed. Add --live to post these.")
 
 
-def unwind(c: SuperMarketClient, live: bool) -> None:
+def sellable_above(book: dict, floor_price: float, cap: float) -> tuple[int, float]:
+    """Walk the bid ladder and return (shares, lowest price) sellable at or above
+    `floor_price`, capped at `cap` shares.
+
+    Sizing to actual depth is the whole point: a market sell for the full position
+    would walk straight through the bids and give back the edge, because depth
+    above our entry is typically only a few hundred shares.
+    """
+    taken = 0
+    lowest = None
+    for lvl in sorted(book.get("bids") or [], key=lambda l: -l["price"]):
+        if lvl["price"] < floor_price:
+            break
+        take = min(lvl["quantity"], cap - taken)
+        if take <= 0:
+            break
+        taken += take
+        lowest = lvl["price"]
+    return int(taken), (lowest if lowest is not None else 0.0)
+
+
+def unwind(
+    c: SuperMarketClient,
+    live: bool,
+    cross: bool = False,
+    cross_min_edge: float = 0.005,
+) -> None:
     """Post exits only where selling beats holding.
 
     Our profit is the discount to fair we were filled at. Holding to settlement
@@ -103,13 +129,41 @@ def unwind(c: SuperMarketClient, live: bool) -> None:
             print(f"  ex {exid}: exit already resting for {already:,.0f} of "
                   f"{p['quantity']:,} — leaving it")
             continue
-        book = c.exchange_orderbook(exid, depth=5)
+        book = c.exchange_orderbook(exid, depth=50)
         bid, ask = book.get("bestBid"), book.get("bestAsk")
         if bid is None or ask is None:
             print(f"  ex {exid}: one-sided book, skipping")
             continue
         fair = (bid + ask) / 2
         avg = p["avgCost"]
+        uncovered = int(p["quantity"] - already)
+
+        # Phase 1 — take the certain profit by crossing, sized to real depth.
+        # Equivalent to the pair-cancel framing: buying NO at n while long YES
+        # cancels for 1 and nets bestBid - avg, so this is profitable exactly when
+        # NO bid + entry < 1. It gives up the gap between bid and fair, in exchange
+        # for immediate certainty and recycled capital.
+        if cross and uncovered > 0:
+            floor_px = round_to_tick(avg + cross_min_edge)
+            qty, lowest = sellable_above(book, floor_px, uncovered)
+            if qty > 0:
+                locked = (lowest - avg) * qty
+                print(f"  ex {exid} CROSS {qty:,} sh down to {lowest} "
+                      f"(entry {avg:.3f}) -> locks >= {locked:+,.0f}")
+                if live:
+                    r = c.place_order(exid, "yes", "sell", qty, lowest)
+                    done = r.get("quantityTraded") or 0
+                    print(f"    traded {done:,} @ {r.get('fillPrice')} "
+                          f"terminalReasonCode={r.get('terminalReasonCode')}")
+                    uncovered -= int(done)
+                else:
+                    uncovered -= qty
+            else:
+                print(f"  ex {exid}: no bid depth at or above {floor_px} "
+                      f"(entry {avg:.3f}, bid {bid})")
+
+        if uncovered <= 0:
+            continue
         # JOIN the offer rather than undercut it. Undercutting by a tick and then
         # demanding target > fair is unsatisfiable unless the spread exceeds two
         # ticks: ask - TICK > (bid+ask)/2  <=>  spread > 2*TICK. Most books here
@@ -117,18 +171,15 @@ def unwind(c: SuperMarketClient, live: bool) -> None:
         # ask always clears fair, since ask > mid by construction.
         target = round_to_tick(ask)
         floor = max(fair, avg)                    # must beat holding AND our entry
-        gain = (target - avg) * p["quantity"]
-        print(f"  ex {exid} qty {p['quantity']:,} avgCost {avg:.3f} fair {fair:.3f} "
+        gain = (target - avg) * uncovered
+        print(f"  ex {exid} qty {uncovered:,} avgCost {avg:.3f} fair {fair:.3f} "
               f"ask {ask} -> offer at {target} for {gain:+,.0f}")
         if target <= floor:
             why = "below fair, so holding is worth more" if target <= fair else "below our cost"
             print(f"    not posting: {target} is {why} (hold EV/share = {fair:.3f})")
             continue
-        remaining = int(p["quantity"] - already)
-        if remaining <= 0:
-            continue
         if live:
-            r = c.place_order(exid, "yes", "sell", remaining, target)
+            r = c.place_order(exid, "yes", "sell", uncovered, target)
             print(f"    placed: open={r.get('open')} traded={r.get('quantityTraded')} "
                   f"canonical={ {k: r.get(k) for k in ('side', 'action', 'price')} }")
     if not live:
@@ -160,6 +211,11 @@ def main() -> int:
     ap.add_argument("--cash-floor-pct", type=float, default=0.25,
                     help="hard stop: cancel everything if cash falls below this "
                          "fraction of the starting balance (default 0.25)")
+    ap.add_argument("--cross-exit", action="store_true",
+                    help="also cross into the bids to lock certain profit, sized to "
+                         "depth above entry (equivalent to: exit when NO bid + entry < 1)")
+    ap.add_argument("--cross-min-edge", type=float, default=0.005,
+                    help="minimum profit per share required to cross (default one tick)")
     ap.add_argument("--shrink-tol", type=float, default=0.25,
                     help="fraction a resting rung may be shrunk by the engine before "
                          "we re-post it; set high when overbooked (default 0.25)")
@@ -241,7 +297,7 @@ def main() -> int:
                 res = apply_plan(c, plans, live=args.live, shrink_tol=args.shrink_tol)
 
             if args.unwind and npass % args.unwind_every == 0:
-                unwind(c, args.live)
+                unwind(c, args.live, cross=args.cross_exit, cross_min_edge=args.cross_min_edge)
 
             open_orders = len(c.open_orders())
             print(f"\npass {npass}: {res['placed']} rungs, {res['writes']} writes, "
