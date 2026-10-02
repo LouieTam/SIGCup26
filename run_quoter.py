@@ -18,6 +18,7 @@ import json
 import os
 import signal
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -176,8 +177,9 @@ def main() -> int:
     ap.add_argument("--interval", type=float, default=180.0, help="refresh seconds")
     ap.add_argument("--once", action="store_true", help="single pass")
     ap.add_argument("--unwind", action="store_true", help="run the exit pass too")
-    ap.add_argument("--unwind-every", type=int, default=1,
-                    help="run the exit pass every N passes (default every pass)")
+    ap.add_argument("--unwind-interval", type=float, default=120.0,
+                    help="seconds between exit passes; runs in its own thread so it is "
+                         "never starved by the ladder phase (default 120)")
     ap.add_argument("--max-hours", type=float, help="stop after this many hours")
     ap.add_argument("--max-deploy-pct", type=float,
                     help="halt new ladders once this fraction of starting cash has "
@@ -222,6 +224,27 @@ def main() -> int:
     started = time.time()
     print(f"starting cash {start_cash:,.2f} | deploy cap {deploy_cap:,.0f} "
           f"| hard floor {cash_floor:,.0f}")
+
+    # Exits run in their own thread. The ladder phase takes ~45 min (batch orders
+    # are placed serially server-side), so an exit pass sequenced after it would
+    # only run hourly — far too slow when a swept fill reverts in ~75s. Exits are
+    # cheap (a dozen reads, a few writes) and the two paths touch disjoint orders:
+    # exits are sells cancelled by id, ladders are buys.
+    def exit_loop() -> None:
+        while not _stop:
+            try:
+                unwind(c, args.live, min_edge=args.min_exit_edge,
+                       reprice_ticks=args.reprice_ticks)
+            except (ApiError, OSError) as e:
+                print(f"[exits] failed: {type(e).__name__}: {e}", flush=True)
+            for _ in range(int(max(1.0, args.unwind_interval))):
+                if _stop:
+                    return
+                time.sleep(1)
+
+    if args.unwind:
+        threading.Thread(target=exit_loop, name="exits", daemon=True).start()
+        print(f"exit thread started, every {args.unwind_interval:.0f}s")
 
     npass = 0
     consecutive_errors = 0
@@ -268,9 +291,6 @@ def main() -> int:
                 )
                 show(plans, stats, args.live)
                 res = apply_plan(c, plans, live=args.live, shrink_tol=args.shrink_tol)
-
-            if args.unwind and npass % args.unwind_every == 0:
-                unwind(c, args.live, min_edge=args.min_exit_edge, reprice_ticks=args.reprice_ticks)
 
             open_orders = len(c.open_orders())
             print(f"\npass {npass}: {res['placed']} rungs, {res['writes']} writes, "
