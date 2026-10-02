@@ -95,7 +95,24 @@ fills several rungs at once, the engine must either reject fills, cancel
 remaining orders, or let the balance go negative — and **we do not know which**.
 Finding out by accident during a real sweep is the worst way to learn it.
 
-So: keep a **self-imposed cap on total resting notional** (ours, enforced
+> **Resolved 2026-10-01 (commit a7f04e5), by deliberate over-commitment:**
+> - **Admission:** each order is shrunk *at placement* to at most 100% of cash.
+>   Asked for 2,000,000 @ 0.10 (200K notional); exactly 1,000,000 rested. The
+>   response still reports the requested quantity, so read the resting size back.
+> - **No aggregate limit:** 2.5x cash rested across markets without complaint.
+> - **Execution:** once total resting notional exceeds cash, **buys that need to
+>   execute are silently blocked**. With 250,461 resting, a 100-share buy at the
+>   ask returned `orderId: null` and traded nothing; after cancelling down to
+>   48,462 the same order filled at once. No error code is raised, so check
+>   `quantityTraded`.
+> - **Sells are cash-positive and never blocked** (verified at 72.8x
+>   overbooking), so exits keep working however overbooked the ladders are.
+>
+> The live configuration deliberately overbooks (`--race-pct 1.0
+> --budget-pct 60`), at the user's direction. See `STRATEGY.md` §2.
+
+The original recommendation follows. It was superseded by the decision above.
+Keep a **self-imposed cap on total resting notional** (ours, enforced
 client-side, tracked across all bots on the account) even though the platform
 does not require one. Not because capital is reserved, but because the failure
 mode of over-commitment is unknown. Determining it deliberately — with a
@@ -161,7 +178,37 @@ Those prints are permanently baked into the cumulative average, and because the
 denominator is already ~3M shares, **no realistic amount of honest trading will
 pull the mark back to fair value before 2026-11-04.**
 
-### Consequences
+### What leaderboard P&L actually is: verified 2026-10-02 (supersedes "ignore it")
+
+**`pnl` = cash + open positions marked at `valuation_price` − 100,000**, i.e.
+account value minus starting capital. Checked on our own row:
+
+```
+leaderboard rank 35 (of 812): pnl 17,646.81
+cash 108,171.82 + marked positions 9,468.27 - 100,000 = 17,640.09   (gap = read timing)
+```
+
+Re-verified the same day: leaderboard 17,754.41 against cash + marked positions
+17,754.25, and against cash + positions at cost 17,358.27. **Open positions count
+at the exchange's mark**, which sat slightly above the book (ex994: 0.905 against
+0.89/0.90).
+
+So the board **is a valid reference: it is realised trading P&L (cash) plus
+whatever is still open at a mark.** For an account that recycles its gains, the
+board is essentially real.
+
+- `roi` = pnl / volume (rank 1: 673,363 / 1,896,726 = 35.5%).
+- **P&L larger than volume does NOT imply unrealised gains.** (Rank 5: +500K on
+  270K volume, 233 trades.) Closing a position by buying the opposite side is
+  paid out at 1 per YES+NO pair, but only the purchase prices count as volume.
+  Buy YES at 0.03 and later NO at 0.05: volume 0.08, realised 0.92 per share. A
+  profile like rank 5's is consistent with very deep fills on dumps, fully
+  closed out. (An earlier note here argued the opposite; that was wrong.)
+
+Top 10 at 2026-10-02 ~16:30Z: 673K, 633K, 601K, 541K, 500K, 479K, 428K, 405K,
+252K, 243K. We were rank 35 at +17.6K.
+
+### Consequences (original analysis; read with the correction above)
 
 1. **Leaderboard marks are unrelated to fair value.** Unrealized P&L marks every
    position at the cumulative VWAP, which can overstate a position badly (market
@@ -305,7 +352,7 @@ budget.
    workers only run every 4 hours. Final rank depends on settlement that
    happens after we can no longer act.
 4. **The leaderboard is marked at cumulative VWAP, not executable prices** — see
-   Q6. Resolved, and the answer is that leaderboard P&L should be ignored
+   Q6. **[Superseded 2026-10-02: the board is cash + open positions at a mark, so it is a valid reference; see Q6.]** Original text: leaderboard P&L should be ignored
    entirely.
 5. **The API is slow: 2–17s per call** (`/account` took 17.5s, `/nodes` ~5s,
    market list 7.6s). The 100 reads/min budget is *not* the binding constraint

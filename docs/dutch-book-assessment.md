@@ -69,7 +69,10 @@ Georgia 3.96, Texas Governor 7.59, both at 0.50% ROC.
 
 ## Four reasons it is worse than those numbers suggest
 
-1. **Latency makes one tick unwinnable.** This API answers in **2–17 seconds**
+1. **[Corrected 2026-10-02: wrong. See `docs/mirror-and-arb-recheck.md` §2.
+   Live websocket tracking found a median episode length of 79s, and many lasted
+   minutes. The verdict stands for capital-efficiency reasons (§2.3 there).]**
+   **Latency makes one tick unwinnable.** This API answers in **2–17 seconds**
    (measured: `/account` 17.5s, orderbook reads 2–5s, collector cycles swinging
    13–56s). Taking a one-tick arb means crossing to hit resting bids. By the
    time an order lands, a faster participant has pulled or improved them. On a

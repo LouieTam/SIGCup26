@@ -128,6 +128,22 @@ little, which is a relief given the latency we measured.
    simultaneous multi-race sweep could fill past the cash balance, and the
    engine's behaviour then is unknown. With single events filling 28,736 of
    capital, this is no longer theoretical. Resolve it before scaling.
+   **Resolved:** see `docs/open-questions-answered.md` Q3. Orders are shrunk to
+   cash at placement, and buys are silently blocked once total resting exceeds
+   cash.
+
+## What the live ladder actually earned (2026-10-01/02)
+
+- **Depth that pays in fair ≥ 0.90 races** (`analyze_depth.py`, 20 markets):
+  0.95 of fair gave 2.3% ROC, 0.90 gave 4.4%, 0.85 gave 3.6%, and nothing
+  traded at or below 0.78. The rungs were reweighted accordingly
+  (`sigcup/quoter.py` `DEFAULT_RUNGS`).
+- **First fills:** all landed on the top rung at 0.91. Four of five recovered.
+  South Dakota Senate R filled at 0.895 and then marked 0.85: that was a
+  genuine repricing, which is the adverse-selection cost of quoting near fair.
+- **Massachusetts Governor D, 2026-10-02 15:26Z:** one atomic sweep took five
+  rungs, 110,324 shares at an average of 0.842. It recovered to ~0.905 and was
+  exited inside ~30 minutes, for about +7K. See `docs/exit-management.md`.
 
 ## Correction to the leaderboard reading
 
@@ -144,6 +160,6 @@ understated it in another:
   Buying at 0.117 something that recovers to 0.933 is a genuine profit.
 
 So the leaders' P&L is probably a mix of real sweep capture and arbitrary marks.
-The practical rules are unchanged — ignore the board, mark from the book, only
+**[2026-10-02: the board is now known to be cash + open positions at a mark, so it is a valid reference; see open-questions Q6.]** Original: the practical rules are unchanged — ignore the board, mark from the book, only
 settled cash scores — but competitors who caught these sweeps are genuinely
 ahead, not merely flattered by the mark.

@@ -2,6 +2,14 @@
 
 Context for building a trading bot for the SIG Predictions Cup (2026 Midterm Elections competition) on https://sig.thesuper.market. Written 2026-10-01, ~2.5h after the competition opened.
 
+> **This is the original brief and is not kept current.** For the live strategy,
+> its priorities and the decisions taken since, read `STRATEGY.md` first.
+> Superseded points include:
+> - §2 Phase 2 "concentrate": directional bets were dropped 2026-10-02;
+> - §2 and §4 "do not optimize the displayed balance": leaderboard P&L is
+>   cash + VWAP-marked positions − 100K, a valid reference
+>   (`docs/open-questions-answered.md` Q6).
+
 Read this first, then the API reference and guide pages saved in `docs/`.
 
 ---
