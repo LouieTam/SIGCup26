@@ -22,7 +22,7 @@ import time
 from datetime import datetime, timezone
 
 from sigcup.catalog import group_by_race, load_catalog
-from sigcup.client import ApiError, SuperMarketClient, load_env, round_to_tick
+from sigcup.client import TICK, ApiError, SuperMarketClient, load_env, round_to_tick
 from sigcup.quoter import apply_plan, plan_races
 
 _stop = False
@@ -64,11 +64,22 @@ def show(plans, stats, live: bool) -> None:
         print("\nDRY RUN — nothing was placed. Add --live to post these.")
 
 
-def unwind(c: SuperMarketClient, live: bool, exit_frac: float = 0.97) -> None:
-    """Post sell orders near fair for positions bought well below it.
+def unwind(c: SuperMarketClient, live: bool) -> None:
+    """Post exits only where selling beats holding.
 
-    Recycling beats holding: it converts a reverted sweep into cash that re-arms
-    the ladder, instead of leaving a directional bet open until settlement.
+    Our profit is the discount to fair we were filled at. Holding to settlement
+    is worth `fair` per share in expectation (it pays 1 with probability ~fair),
+    so:
+
+        sell above fair  -> strictly better than holding; post it
+        sell below fair  -> hands the edge back; hold instead
+
+    So the exit undercuts the best offer by one tick for queue priority, and is
+    posted only when that price still clears both fair and our average cost.
+
+    The earlier version targeted `fair * 0.97`, which was calibrated for deep
+    fills (buy at 0.25 of fair). After the ladder was reweighted shallow, that
+    target landed on our own entry price and nothing ever exited.
     """
     print("\n=== unwind pass ===")
     pos = [p for p in c.positions() if p["quantity"] > 0]
@@ -99,12 +110,14 @@ def unwind(c: SuperMarketClient, live: bool, exit_frac: float = 0.97) -> None:
             continue
         fair = (bid + ask) / 2
         avg = p["avgCost"]
-        target = round_to_tick(min(fair * exit_frac, ask))
+        target = round_to_tick(ask - TICK)        # undercut the offer, don't cross
+        floor = max(fair, avg)                    # must beat holding AND our entry
         gain = (target - avg) * p["quantity"]
         print(f"  ex {exid} qty {p['quantity']:,} avgCost {avg:.3f} fair {fair:.3f} "
-              f"-> sell at {target} for {gain:+,.0f}")
-        if gain <= 0:
-            print("    underwater at fair — holding rather than realising a loss")
+              f"ask {ask} -> sell at {target} for {gain:+,.0f}")
+        if target <= floor:
+            why = "below fair, so holding is worth more" if target <= fair else "below our cost"
+            print(f"    not posting: {target} is {why} (hold EV/share = {fair:.3f})")
             continue
         remaining = int(p["quantity"] - already)
         if remaining <= 0:
