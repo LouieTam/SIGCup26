@@ -64,48 +64,33 @@ def show(plans, stats, live: bool) -> None:
         print("\nDRY RUN — nothing was placed. Add --live to post these.")
 
 
-def sellable_above(book: dict, floor_price: float, cap: float) -> tuple[int, float]:
-    """Walk the bid ladder and return (shares, lowest price) sellable at or above
-    `floor_price`, capped at `cap` shares.
-
-    Sizing to actual depth is the whole point: a market sell for the full position
-    would walk straight through the bids and give back the edge, because depth
-    above our entry is typically only a few hundred shares.
-    """
-    taken = 0
-    lowest = None
-    for lvl in sorted(book.get("bids") or [], key=lambda l: -l["price"]):
-        if lvl["price"] < floor_price:
-            break
-        take = min(lvl["quantity"], cap - taken)
-        if take <= 0:
-            break
-        taken += take
-        lowest = lvl["price"]
-    return int(taken), (lowest if lowest is not None else 0.0)
-
-
 def unwind(
     c: SuperMarketClient,
     live: bool,
-    cross: bool = False,
-    cross_min_edge: float = 0.005,
+    min_edge: float = 0.005,
+    reprice_ticks: int = 2,
 ) -> None:
-    """Post exits only where selling beats holding.
+    """Exit by improving the offer: post a YES sell one tick inside the best ask.
 
-    Our profit is the discount to fair we were filled at. Holding to settlement
-    is worth `fair` per share in expectation (it pays 1 with probability ~fair),
-    so:
+    Equivalent formulation (and where this rule came from): post a NO bid one
+    tick above the best NO bid. Since a NO bid at `n` is a YES offer at `1 - n`,
+    and buying NO while long YES cancels the pair for 1 immediately, the profit is
+    `1 - avg - n` == `(ask - TICK) - avg`. The two are the same order.
 
-        sell above fair  -> strictly better than holding; post it
-        sell below fair  -> hands the edge back; hold instead
+    Why improve rather than join the ask: at the ask we queue behind everyone
+    already there; one tick inside, we are the best offer and fill first. In a
+    one-tick-spread market `ask - TICK` IS the bid, so the order crosses and fills
+    immediately — the rule degenerates gracefully into taking the bid.
 
-    So the exit undercuts the best offer by one tick for queue priority, and is
-    posted only when that price still clears both fair and our average cost.
+    No depth-walking is needed: a limit sell only fills against bids at or above
+    its price, so the limit itself prevents walking the book down.
 
-    The earlier version targeted `fair * 0.97`, which was calibrated for deep
-    fills (buy at 0.25 of fair). After the ladder was reweighted shallow, that
-    target landed on our own entry price and nothing ever exited.
+    The floor is `avg + min_edge`, NOT fair. Fair was the wrong guard — it blocks
+    the rule whenever the spread is under two ticks (`ask - TICK > fair` requires
+    `spread > 2*TICK`), and it is inconsistent with taking the bid at all. Flooring
+    at cost is what actually matters: it guarantees we never realise a loss. When
+    the floor sits above the ask (a position that moved against us) the order rests
+    above the market as free optionality on a rally rather than selling at a loss.
     """
     print("\n=== unwind pass ===")
     pos = [p for p in c.positions() if p["quantity"] > 0]
@@ -113,75 +98,64 @@ def unwind(
         print("  no long positions")
         return
 
-    # Sells already resting, per exchange. Without this the loop re-posts an exit
-    # every pass; those stack past the position size, and the engine canonicalizes
-    # an oversized sell into a complement buy — i.e. it would quietly open a short.
-    resting_sells: dict[str, float] = {}
+    sells: dict[str, list[dict]] = {}
     for o in c.open_orders():
         if o.get("open") and o.get("action") == "sell":
-            exid = str(o["exchangeId"])
-            resting_sells[exid] = resting_sells.get(exid, 0.0) + float(o["quantity"])
+            sells.setdefault(str(o["exchangeId"]), []).append(o)
 
     for p in pos:
         exid = str(p["exchangeId"])
-        already = resting_sells.get(exid, 0.0)
-        if already >= p["quantity"]:
-            print(f"  ex {exid}: exit already resting for {already:,.0f} of "
-                  f"{p['quantity']:,} — leaving it")
-            continue
-        book = c.exchange_orderbook(exid, depth=50)
-        bid, ask = book.get("bestBid"), book.get("bestAsk")
-        if bid is None or ask is None:
-            print(f"  ex {exid}: one-sided book, skipping")
-            continue
-        fair = (bid + ask) / 2
+        qty = int(p["quantity"])
         avg = p["avgCost"]
-        uncovered = int(p["quantity"] - already)
+        book = c.exchange_orderbook(exid, depth=5)
+        bid, ask = book.get("bestBid"), book.get("bestAsk")
+        if ask is None:
+            print(f"  ex {exid}: no offer side, skipping")
+            continue
+        fair = ((bid + ask) / 2) if bid is not None else ask
 
-        # Phase 1 — take the certain profit by crossing, sized to real depth.
-        # Equivalent to the pair-cancel framing: buying NO at n while long YES
-        # cancels for 1 and nets bestBid - avg, so this is profitable exactly when
-        # NO bid + entry < 1. It gives up the gap between bid and fair, in exchange
-        # for immediate certainty and recycled capital.
-        if cross and uncovered > 0:
-            floor_px = round_to_tick(avg + cross_min_edge)
-            qty, lowest = sellable_above(book, floor_px, uncovered)
-            if qty > 0:
-                locked = (lowest - avg) * qty
-                print(f"  ex {exid} CROSS {qty:,} sh down to {lowest} "
-                      f"(entry {avg:.3f}) -> locks >= {locked:+,.0f}")
+        improve = round_to_tick(ask - TICK)
+        floor = round_to_tick(avg + min_edge)
+        target = max(improve, floor)
+        crosses = bid is not None and target <= bid
+
+        existing = sells.get(exid, [])
+        resting = sum(int(o["quantity"]) for o in existing)
+        # Re-price stale exits. Cancel by order id, never cancel-all — that would
+        # also wipe the sweep ladder resting on the same exchange.
+        stale = [o for o in existing
+                 if o.get("priceLimit") is not None
+                 and abs(float(o["priceLimit"]) - target) > reprice_ticks * TICK]
+        if stale:
+            print(f"  ex {exid}: repricing {len(stale)} stale exit(s) "
+                  f"{[o['priceLimit'] for o in stale]} -> {target}")
+            for o in stale:
                 if live:
-                    r = c.place_order(exid, "yes", "sell", qty, lowest)
-                    done = r.get("quantityTraded") or 0
-                    print(f"    traded {done:,} @ {r.get('fillPrice')} "
-                          f"terminalReasonCode={r.get('terminalReasonCode')}")
-                    uncovered -= int(done)
+                    try:
+                        c.cancel(str(o["id"]))
+                        resting -= int(o["quantity"])
+                    except ApiError as e:
+                        print(f"    cancel {o['id']}: {e.code}")
                 else:
-                    uncovered -= qty
-            else:
-                print(f"  ex {exid}: no bid depth at or above {floor_px} "
-                      f"(entry {avg:.3f}, bid {bid})")
+                    resting -= int(o["quantity"])
 
+        uncovered = qty - resting
+        tag = "CROSSES now" if crosses else "rests as best offer"
+        if target > ask:
+            tag = "rests ABOVE market (optionality; floor is above the ask)"
+        print(f"  ex {exid} qty {qty:,} avg {avg:.3f} bid {bid} ask {ask} fair {fair:.3f}"
+              f" -> offer {target} ({tag}), uncovered {uncovered:,}, "
+              f"edge {(target-avg)*max(uncovered,0):+,.0f}")
         if uncovered <= 0:
             continue
-        # JOIN the offer rather than undercut it. Undercutting by a tick and then
-        # demanding target > fair is unsatisfiable unless the spread exceeds two
-        # ticks: ask - TICK > (bid+ask)/2  <=>  spread > 2*TICK. Most books here
-        # are 0.005-0.015 wide, which is why no exit ever posted. Sitting AT the
-        # ask always clears fair, since ask > mid by construction.
-        target = round_to_tick(ask)
-        floor = max(fair, avg)                    # must beat holding AND our entry
-        gain = (target - avg) * uncovered
-        print(f"  ex {exid} qty {uncovered:,} avgCost {avg:.3f} fair {fair:.3f} "
-              f"ask {ask} -> offer at {target} for {gain:+,.0f}")
-        if target <= floor:
-            why = "below fair, so holding is worth more" if target <= fair else "below our cost"
-            print(f"    not posting: {target} is {why} (hold EV/share = {fair:.3f})")
+        if target < floor:
+            print(f"    skipped: {target} below cost floor {floor}")
             continue
         if live:
             r = c.place_order(exid, "yes", "sell", uncovered, target)
-            print(f"    placed: open={r.get('open')} traded={r.get('quantityTraded')} "
-                  f"canonical={ {k: r.get(k) for k in ('side', 'action', 'price')} }")
+            print(f"    placed: traded {r.get('quantityTraded') or 0:,} @ "
+                  f"{r.get('fillPrice')} open={r.get('open')} "
+                  f"terminalReasonCode={r.get('terminalReasonCode')}")
     if not live:
         print("  DRY RUN — no exits placed.")
 
@@ -211,11 +185,10 @@ def main() -> int:
     ap.add_argument("--cash-floor-pct", type=float, default=0.25,
                     help="hard stop: cancel everything if cash falls below this "
                          "fraction of the starting balance (default 0.25)")
-    ap.add_argument("--cross-exit", action="store_true",
-                    help="also cross into the bids to lock certain profit, sized to "
-                         "depth above entry (equivalent to: exit when NO bid + entry < 1)")
-    ap.add_argument("--cross-min-edge", type=float, default=0.005,
-                    help="minimum profit per share required to cross (default one tick)")
+    ap.add_argument("--min-exit-edge", type=float, default=0.005,
+                    help="minimum profit per share required to post an exit (default one tick)")
+    ap.add_argument("--reprice-ticks", type=int, default=2,
+                    help="re-price a resting exit once it drifts this many ticks from target")
     ap.add_argument("--shrink-tol", type=float, default=0.25,
                     help="fraction a resting rung may be shrunk by the engine before "
                          "we re-post it; set high when overbooked (default 0.25)")
@@ -297,7 +270,7 @@ def main() -> int:
                 res = apply_plan(c, plans, live=args.live, shrink_tol=args.shrink_tol)
 
             if args.unwind and npass % args.unwind_every == 0:
-                unwind(c, args.live, cross=args.cross_exit, cross_min_edge=args.cross_min_edge)
+                unwind(c, args.live, min_edge=args.min_exit_edge, reprice_ticks=args.reprice_ticks)
 
             open_orders = len(c.open_orders())
             print(f"\npass {npass}: {res['placed']} rungs, {res['writes']} writes, "
