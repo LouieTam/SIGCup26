@@ -110,11 +110,16 @@ def unwind(c: SuperMarketClient, live: bool) -> None:
             continue
         fair = (bid + ask) / 2
         avg = p["avgCost"]
-        target = round_to_tick(ask - TICK)        # undercut the offer, don't cross
+        # JOIN the offer rather than undercut it. Undercutting by a tick and then
+        # demanding target > fair is unsatisfiable unless the spread exceeds two
+        # ticks: ask - TICK > (bid+ask)/2  <=>  spread > 2*TICK. Most books here
+        # are 0.005-0.015 wide, which is why no exit ever posted. Sitting AT the
+        # ask always clears fair, since ask > mid by construction.
+        target = round_to_tick(ask)
         floor = max(fair, avg)                    # must beat holding AND our entry
         gain = (target - avg) * p["quantity"]
         print(f"  ex {exid} qty {p['quantity']:,} avgCost {avg:.3f} fair {fair:.3f} "
-              f"ask {ask} -> sell at {target} for {gain:+,.0f}")
+              f"ask {ask} -> offer at {target} for {gain:+,.0f}")
         if target <= floor:
             why = "below fair, so holding is worth more" if target <= fair else "below our cost"
             print(f"    not posting: {target} is {why} (hold EV/share = {fair:.3f})")
