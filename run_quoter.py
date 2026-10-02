@@ -107,6 +107,8 @@ def unwind(
     for p in pos:
         exid = str(p["exchangeId"])
         qty = int(p["quantity"])
+        if qty <= 0:
+            continue
         avg = p["avgCost"]
         book = c.exchange_orderbook(exid, depth=5)
         bid, ask = book.get("bestBid"), book.get("bestAsk")
@@ -140,7 +142,14 @@ def unwind(
                 else:
                     resting -= int(o["quantity"])
 
-        uncovered = qty - resting
+        # Only ever ONE resting sell per exchange, sized from a fresh position read.
+        # Never top up: `qty` can be stale high (positions lag fills), so qty-resting
+        # overstates the remainder and the extra sell flips us short.
+        if resting > 0:
+            print(f"  ex {exid}: {resting:,} already offered of {qty:,} — "
+                  f"not topping up (positions lag fills)")
+            continue
+        uncovered = qty
         tag = "CROSSES now" if crosses else "rests as best offer"
         if target > ask:
             tag = "rests ABOVE market (optionality; floor is above the ask)"
@@ -318,9 +327,12 @@ def main() -> int:
                 "ts": datetime.now(timezone.utc).isoformat(), "pass": npass,
                 "error": f"{type(e).__name__}: {e}", "consecutive": consecutive_errors,
             }) + "\n")
-            if consecutive_errors >= 15:
-                print("!! 15 consecutive failures — something is structurally wrong. Exiting.")
-                break
+            # Never exit on transient failures. A platform 500-storm once took the
+            # API down for hours; giving up after 15 errors left us offline for 8
+            # hours while the ladders sat unmanaged. Back off hard and keep waiting.
+            if consecutive_errors in (5, 15, 30) or consecutive_errors % 60 == 0:
+                print(f"!! {consecutive_errors} consecutive failures — still retrying "
+                      f"(API may be down; resting orders are unaffected)", flush=True)
             time.sleep(min(30 * consecutive_errors, 300))
             continue
 
