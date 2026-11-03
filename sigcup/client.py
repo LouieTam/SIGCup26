@@ -168,6 +168,11 @@ class SuperMarketClient:
                     err = json.loads(raw).get("error", {})
                 except Exception:
                     err = {}
+                if not isinstance(err, dict):
+                    # Some responses carry `"error": "Not Found"` as a bare string.
+                    # Calling .get on it raised AttributeError, which no caller
+                    # catches; that killed the live quoter 2026-10-03 ~03:15Z.
+                    err = {"message": str(err)}
                 code = err.get("code") or f"HTTP_{e.code}"
                 msg = err.get("message") or (raw[:300].decode("utf-8", "replace"))
                 exc_cls = RateLimited if e.code == 429 else ApiError

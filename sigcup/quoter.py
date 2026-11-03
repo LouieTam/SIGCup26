@@ -223,6 +223,81 @@ def build_mirror_ladder(
     return quotes
 
 
+# Mirror rungs (fraction of NO fair, weight), from the full-depth replay of
+# 2026-10-02 00:00-22:00Z (docs/mirror-and-arb-recheck.md §5). Mirror ROC was
+# 3.4/3.4/3.0/2.6/2.2/1.7% at 0.95/0.92/0.90/0.87/0.84/0.80. The 0.55-0.75 band
+# caught the big longshot spikes (OK Senate D to 0.46, best deep ROC 1.55% at
+# 0.60). 0.45 and 0.25 never filled in any window, so that tail moved to 0.70/0.60.
+MIRROR_RUNGS: list[tuple[float, float]] = [
+    (0.95, 3.0),
+    (0.92, 3.0),
+    (0.90, 3.0),
+    (0.87, 2.5),
+    (0.84, 2.0),
+    (0.80, 1.5),
+    (0.70, 0.7),
+    (0.60, 0.8),
+]
+
+
+# Cheap side: (ticks above the favourite's fair, size weight), from the same
+# replay. ROC on cash was 9.4/10.3/10.9/12.5/7.1% at +3/+4/+6/+8/+10 ticks
+# (hit 78/68/47/23/10 of ~84 favourites). +1/+2 are skipped: that is the touch,
+# where queues are deep and the exit leaves the least margin.
+CHEAP_RUNGS: list[tuple[int, float]] = [(3, 1.0), (4, 1.0), (6, 1.5), (8, 1.5), (10, 0.5)]
+# 2026-10-21 (user decision, docs/loss-analysis-1013-1020.md): only NO bids
+# strictly below this. Since 10-12 the cheap side made money only below NO 0.10;
+# at 0.10-0.25 it took the big stop losses (50-180K shares, 1-2 ticks each).
+CHEAP_MAX_NO = 0.10
+
+
+def build_cheap_ladder(
+    leg: Leg,
+    fav_fair: float,
+    race_notional: float,
+    rungs: list[tuple[int, float]] = None,
+    min_qty: int = 10,
+    max_no: float = CHEAP_MAX_NO,
+) -> list[Quote]:
+    """NO bids on the FAVOURITE: YES offers k ticks above its fair.
+
+    On a near-certain market a NO share costs 1 - offer, i.e. 0.01-0.05, so
+    each unit of cash carries 20-100x the notional of a ladder rung. A fill
+    means someone paid well over fair for the favourite, typically an
+    overnight buyer walking the book. The exit sells the NO back once the price
+    settles (or pairs off against a YES holding for 1 per pair). Every rung is
+    strictly above the best YES ask, so nothing crosses, and it can never cross
+    our own YES bids, which sit strictly below the best bid.
+    """
+    rungs = rungs or CHEAP_RUNGS
+    if leg.best_ask is None:
+        return []
+    floor = round_to_tick(leg.best_ask + TICK)  # strictly above the best offer
+    priced: list[tuple[float, float]] = []
+    for k, w in rungs:
+        offer = round_to_tick(fav_fair + k * TICK)
+        if offer < floor or offer > 0.995:
+            continue
+        no_px = round_to_tick(1 - offer)
+        if no_px < TICK or any(abs(no_px - p) < TICK / 2 for p, _ in priced):
+            continue
+        priced.append((no_px, w))
+    if not priced:
+        return []
+    # Weights are normalised over ALL fitting rungs before the max_no cut, so
+    # dropping the dearer rungs drops their budget instead of piling it onto the
+    # cheap ones (which would only make those positions bigger).
+    total_w = sum(w for _, w in priced)
+    quotes = []
+    for no_px, w in priced:
+        if no_px >= max_no - 1e-9:
+            continue
+        qty = int(race_notional * (w / total_w) / no_px)
+        if qty >= min_qty:
+            quotes.append(Quote(leg.exchange_id, leg.market_id, no_px, qty, side="no"))
+    return quotes
+
+
 def plan_races(
     c: SuperMarketClient,
     races: dict[str, list[dict]],
@@ -233,6 +308,10 @@ def plan_races(
     per_race_pct: float = 0.10,
     rungs: list[tuple[float, float]] = None,
     mirror_frac: float = 0.0,
+    mirror_rungs: list[tuple[float, float]] = None,
+    cheap_frac: float = 0.0,
+    cheap_rungs: list[tuple[int, float]] = None,
+    cheap_max_no: float = CHEAP_MAX_NO,
 ) -> tuple[list[RacePlan], dict]:
     """Decide what to rest, for which races, inside the exposure caps.
 
@@ -285,6 +364,11 @@ def plan_races(
             plan.quotes = build_ladder(leg, fair, race_budget, rungs)
             if not plan.quotes:
                 plan.skipped = "no rung fits below the best bid"
+            elif cheap_frac > 0:
+                # Same exchange as the main rungs, so they ride in the same plan:
+                # one cancel/repost covers both and ladder_matches checks side.
+                plan.quotes += build_cheap_ladder(leg, fair, race_budget * cheap_frac,
+                                                  cheap_rungs, max_no=cheap_max_no)
         plans.append(plan)
 
         if mirror_frac > 0 and plan.skipped is None:
@@ -295,7 +379,8 @@ def plan_races(
                     continue
                 m = RacePlan(rid, ls.race_name, ls, round(1 - ls_fair, 4), gap, mirror=True)
                 m.quotes = build_mirror_ladder(
-                    ls, ls_fair, race_budget * mirror_frac / len(longshots), rungs)
+                    ls, ls_fair, race_budget * mirror_frac / len(longshots),
+                    mirror_rungs or rungs)
                 if not m.quotes:
                     m.skipped = "no mirror rung fits above the best ask"
                 plans.append(m)
@@ -355,16 +440,18 @@ def ladder_matches(
     tol = tol_ticks * TICK + 1e-9
     unmatched = list(resting)
     for q in desired:
-        hit = None
-        for o in unmatched:
-            p = o.get("priceLimit")
-            if p is None:
-                continue
-            if abs(float(p) - q.price) <= tol and float(o["quantity"]) >= q.quantity * (1 - tol_qty):
-                hit = o
-                break
-        if hit is None:
+        # Pair with the CLOSEST-priced candidate, not the first one in tolerance.
+        # Cheap-side rungs sit 1-2 ticks apart (0.04/0.03/0.02/0.01/0.005), inside
+        # the 3-tick tolerance, so first-fit paired neighbours, left the last rung
+        # unmatched and reposted ~80 ladders every pass (2026-10-06).
+        cands = [o for o in unmatched
+                 if o.get("priceLimit") is not None
+                 and str(o.get("side", "yes")) == q.side  # YES never matches NO
+                 and abs(float(o["priceLimit"]) - q.price) <= tol
+                 and float(o["quantity"]) >= q.quantity * (1 - tol_qty)]
+        if not cands:
             return False
+        hit = min(cands, key=lambda o: abs(float(o["priceLimit"]) - q.price))
         unmatched.remove(hit)
     return True
 
@@ -393,7 +480,7 @@ def apply_plan(
     the old rungs by id instead (one write per rung rather than one in total).
     """
     resting = current_ladder(c) if live else {}
-    writes = placed = skipped_same = 0
+    writes = placed = skipped_same = refused = 0
     for p in plans:
         if not p.quotes:
             continue
@@ -406,7 +493,13 @@ def apply_plan(
             continue
         c.low_priority.on = True
         try:
-            if resting.get(exid) and held and exid in held():
+            # Never cancel_all over one of our exits. held() comes from position
+            # reads, and those have been inconsistent: on ex1071, 2026-10-03 ~01:20Z,
+            # a repost wiped a 14,875 NO exit that positions should have protected.
+            # So check the live order list right before deciding (one read).
+            live_sells = resting.get(exid) and any(
+                o.get("action") == "sell" for o in c.open_orders(exchangeId=exid))
+            if resting.get(exid) and (live_sells or (held and exid in held())):
                 for o in resting[exid]:
                     try:
                         c.cancel(str(o["id"]))
@@ -423,11 +516,19 @@ def apply_plan(
         finally:
             c.low_priority.on = False
         results = res.get("results") or res.get("data") or []
+        # The engine answers 200/ok but with orderId null (open false, nothing
+        # traded) when it silently REFUSES an order: observed 2026-10-06 once the
+        # account's total resting notional hit ~129x cash. Count those, never
+        # treat them as placed.
+        refused_here = sum(1 for r in results
+                           if r.get("ok") and (r.get("data") or {}).get("orderId") is None)
         ok = sum(1 for r in results if str(r.get("status", "")).startswith("2")) or len(p.quotes)
-        placed += ok
+        placed += ok - refused_here
+        refused += refused_here
         if verbose:
             print(f"    posted {len(p.quotes)} rungs on ex {exid} "
-                  f"({p.notional:,.0f} notional), writes used {writes}")
+                  f"({p.notional:,.0f} notional), writes used {writes}"
+                  + (f"  !! {refused_here} REFUSED by engine (orderId null)" if refused_here else ""))
         if after_write:
             after_write()
-    return {"writes": writes, "placed": placed, "unchanged": skipped_same}
+    return {"writes": writes, "placed": placed, "unchanged": skipped_same, "refused": refused}
