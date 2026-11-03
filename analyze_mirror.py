@@ -40,9 +40,15 @@ from sigcup.quoter import DEFAULT_RUNGS
 DEPTHS = [d for d, _ in DEFAULT_RUNGS]
 
 
+TRUNCATED: list[str] = []
+
+
 def tape(c, exid: str, frm: str, max_pages: int) -> list[dict]:
+    """Trades since `frm`. The endpoint pages NEWEST first, so hitting
+    max_pages silently drops the OLDEST part of the window (2026-10-02: a 5-page
+    cap on ex1072 missed the 00:27 sweep to 0.46). Truncated legs are recorded."""
     out, cursor = [], None
-    for _ in range(max_pages):
+    for i in range(max_pages):
         p = c._get(f"/exchanges/{exid}/trades", tournamentId=c.tournament_id,
                    limit=200, cursor=cursor, **{"from": frm})
         out += p.get("data") or []
@@ -50,8 +56,29 @@ def tape(c, exid: str, frm: str, max_pages: int) -> list[dict]:
         cursor = pg.get("nextCursor")
         if not pg.get("hasMore") or not cursor:
             break
+    else:
+        TRUNCATED.append(exid)
     out.sort(key=lambda t: t["createdAt"])
     return out
+
+
+# Cheap side: YES offers k ticks above the favourite's fair (= NO bids at
+# 1 - offer). Cash per share is 1 - offer, i.e. 0.01-0.05 on a near-certain
+# market, so each unit of cash carries 20-100x the notional of a ladder rung.
+CHEAP_TICKS = [1, 2, 3, 4, 6, 8, 10, 14, 20]
+
+
+def cheap_stats(prints, fair: float, capital: float) -> dict:
+    res = {}
+    for k in CHEAP_TICKS:
+        offer = round(fair + k * 0.005, 3)
+        if offer > 0.995:
+            continue
+        cost = 1 - offer                              # NO price paid per share
+        vol = sum(sz for px, sz in prints if px >= offer - 1e-9)
+        filled = min(capital / cost, vol)
+        res[k] = {"filled": filled, "profit": (offer - fair) * filled, "offer": offer}
+    return res
 
 
 def side_stats(prints, fair: float, capital: float, mirror: bool) -> dict:
@@ -83,7 +110,12 @@ def main() -> int:
     ap.add_argument("--max-pages", type=int, default=5)
     ap.add_argument("--reads-per-min", type=int, default=12)
     ap.add_argument("--out", default="data/mirror.json")
+    ap.add_argument("--depths", help="comma-separated depth grid to evaluate "
+                                     "(default: the live DEFAULT_RUNGS)")
     args = ap.parse_args()
+    global DEPTHS
+    if args.depths:
+        DEPTHS = [float(x) for x in args.depths.split(",")]
 
     load_env()
     c = SuperMarketClient()
@@ -115,6 +147,7 @@ def main() -> int:
     print(f"{len(plan)} races with a favourite in [{args.min_fair}, {args.max_fair}); "
           f"reading tapes since {args.since} at {args.reads_per_min} reads/min\n", flush=True)
 
+    cheap: dict[int, dict] = {}
     agg = {s: {d: {"filled": 0.0, "profit": 0.0, "hit": 0} for d in DEPTHS}
            for s in ("main", "mirror")}
     n_main = n_mirror = 0
@@ -129,12 +162,18 @@ def main() -> int:
             continue
         prints = [(t["price"], t["size"]) for t in t_fav if t.get("price") is not None]
         main_s = side_stats(prints, fav_fair, args.capital, mirror=False)
+        race_cheap = cheap_stats(prints, fav_fair, args.capital)
+        for k, v in race_cheap.items():
+            a = cheap.setdefault(k, {"filled": 0.0, "profit": 0.0, "hit": 0, "legs": 0})
+            a["filled"] += v["filled"]; a["profit"] += v["profit"]
+            a["hit"] += v["filled"] > 0; a["legs"] += 1
         n_main += 1
         for s in find_sweeps(t_fav, 3, 1000):
             if s["reverted"]:
                 sweeps["main"][s["direction"]][0] += 1
                 sweeps["main"][s["direction"]][1] += s["gift"]
         mirror_profit = 0.0
+        mirror_by_depth: dict[str, float] = {}
         for ls_fair, ls in longshots:
             try:
                 t_ls = tape(c, ls["exchangeId"], args.since, args.max_pages)
@@ -148,6 +187,8 @@ def main() -> int:
                 a = agg["mirror"][d]
                 a["filled"] += v["filled"]; a["profit"] += v["profit"]; a["hit"] += v["filled"] > 0
             mirror_profit += sum(v["profit"] for v in mir.values())
+            for d, v in mir.items():
+                mirror_by_depth[str(d)] = mirror_by_depth.get(str(d), 0.0) + v["profit"]
             for s in find_sweeps(t_ls, 3, 1000):
                 if s["reverted"]:
                     sweeps["mirror"][s["direction"]][0] += 1
@@ -158,7 +199,10 @@ def main() -> int:
         main_profit = sum(v["profit"] for v in main_s.values())
         per_race.append({"race": rid, "name": fav.get("raceName"), "fav": fav.get("winnerName"),
                          "fav_fair": fav_fair, "main_profit": main_profit,
-                         "mirror_profit": mirror_profit})
+                         "mirror_profit": mirror_profit,
+                         "mirror_by_depth": mirror_by_depth,
+                         "main_by_depth": {str(d): v["profit"] for d, v in main_s.items()},
+                         "cheap": {str(k): v for k, v in race_cheap.items()}})
         print(f"  {str(fav.get('raceName'))[:34]:<34} fav {fav_fair:.3f}  "
               f"main {main_profit:>8,.0f}  mirror {mirror_profit:>8,.0f}", flush=True)
 
@@ -177,8 +221,18 @@ def main() -> int:
     for s in ("main", "mirror"):
         print(f"  {s:<7} DOWN {sweeps[s]['DOWN'][0]:>3} {sweeps[s]['DOWN'][1]:>10,.0f} | "
               f"UP {sweeps[s]['UP'][0]:>3} {sweeps[s]['UP'][1]:>10,.0f}")
+    print(f"\nCHEAP SIDE: YES offers k ticks above favourite fair (NO bids at 1-offer), "
+          f"{args.capital:,.0f} cash per level per leg")
+    print(f"{'ticks':<7}{'hit':>9}{'shares filled':>15}{'profit':>11}{'ROC on cash':>13}")
+    for k in sorted(cheap):
+        a = cheap[k]
+        roc = a["profit"] / (args.capital * max(a["legs"], 1)) * 100
+        print(f"{k:<7}{a['hit']:>4}/{a['legs']:<4}{a['filled']:>15,.0f}{a['profit']:>11,.0f}{roc:>12.2f}%")
+    if TRUNCATED:
+        print(f"\nWARNING: {len(TRUNCATED)} legs hit --max-pages {args.max_pages}; their OLDEST "
+              f"trades are missing: {TRUNCATED[:12]}{' …' if len(TRUNCATED) > 12 else ''}")
     with open(args.out, "w") as f:
-        json.dump({"args": vars(args), "agg": agg, "sweeps": sweeps, "races": per_race,
+        json.dump({"args": vars(args), "agg": agg, "cheap": cheap, "sweeps": sweeps, "races": per_race,
                    "n_main": n_main, "n_mirror": n_mirror}, f, indent=1)
     print(f"\nwrote {args.out}")
     return 0
