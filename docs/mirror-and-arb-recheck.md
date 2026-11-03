@@ -1,5 +1,13 @@
 # Mirror ladder and arb re-check (2026-10-02)
 
+> **Caveat found later the same day:** every replay in §1 and §3 read at most 5
+> pages (1,000 trades) per leg, and the trades endpoint pages newest first. On
+> busy legs the OLDEST part of each window was silently dropped (ex1072 missed a
+> 00:27Z sweep to 0.46). Main-versus-mirror comparisons are biased alike on both
+> sides. Depth profiles, especially "nothing fills below 0.80", are biased
+> against deep rungs. `analyze_mirror.py` now warns on truncation; see §5 for
+> the full-depth re-run.
+
 Two candidate strategies, tested with new tools against live data.
 
 | Strategy | Verdict |
@@ -231,3 +239,190 @@ positions closed and cash at 121,979.
 - **First hour of the mirror:** NO fills on ex991 (52,695), ex870 (27,325)
   and ex1069 (1,296), about 81K of shares altogether. The mirror catches flow
   quickly, as the tape replay predicted.
+
+## 5. Full-depth re-run and the new rung weights (2026-10-02 00:00–22:00Z)
+
+`analyze_mirror.py --min-fair 0.75 --max-pages 15`: 84 favourites, 86
+longshot legs, fine depth grid.
+
+| depth | main hit | main ROC | mirror hit | mirror ROC |
+|---|---|---|---|---|
+| 0.95 | 47/84 | 2.37% | 67/86 | 3.38% |
+| 0.92 | 23/84 | 1.90% | 45/86 | 3.40% |
+| 0.90 | 17/84 | 1.74% | 28/86 | 3.04% |
+| 0.87 | 9/84 | 1.39% | 16/86 | 2.62% |
+| 0.84 | 5/84 | 1.13% | 10/86 | 2.21% |
+| 0.80 | 2/84 | 0.60% | 6/86 | 1.74% |
+| 0.75–0.55 | 0 | 0 | 1–2/86 each | 0.8–1.6% (best 0.60) |
+| ≤ 0.50 | 0 | 0 | 0 | 0 |
+
+**Totals** (the truncated run had main 30.2K, mirror 35.8K):
+- main 30,677;
+- **mirror 75,408**.
+
+**Reverting sweeps:**
+- longshot buying: 173, worth 679K;
+- favourite dumps: 121, worth 303K.
+
+**New `MIRROR_RUNGS`** (`sigcup/quoter.py`):
+- weight moves to the 0.84–0.95 band (3/3/3/2.5/2);
+- 0.80 at 1.5;
+- the dead 0.45/0.25 tail (zero fills in every window) moves to 0.70/0.60
+  (0.7/0.8), which is where the big longshot spikes landed.
+
+The main ladder's `DEFAULT_RUNGS` stay as they are: below 0.80 the main side
+filled nothing.
+
+**Built-in bias of every replay (not only truncation).** Rung prices are set
+relative to the *current* fair, so a fill counts only when the price has come
+back past it. A fill that was followed by a lasting move against us is never
+counted. The replays therefore cannot measure adverse selection. Treat them as
+a ranking of where flow is, not as a P&L forecast. Live fills so far have been
+mostly profitable, but that is the real test.
+
+## 6. Where the realised P&L came from (replayed 2026-10-03 14:20Z)
+
+`analyze_realized.py` replays the complete transaction history
+(`coverage.complete: true`; 2,970 trades, 2026-10-01 19:52Z → 10-03 14:20Z)
+with average cost per exchange.
+
+| source | realised | share |
+|---|---|---|
+| direct sells of YES holdings (main ladder) | +27,777 | 51.3% |
+| direct sells of NO holdings (mirror ladder) | +26,343 | 48.7% |
+| YES/NO conversions (buying the other side, pairs paid 1) | −10 | ~0% (4 trades) |
+| **total** | **+54,110** | |
+
+- **Cash reconciliation (2026-10-03 ~11:50Z): exact to 2 SUSQies.**
+  100,000 opening deposit − 1,616,508 buys + 1,579,853 sells + 1,938
+  explicit conversion payouts = 65,283. Less 12,687 of fills the transaction
+  feed had not yet recorded (mostly ex1054, 14,058 NO) gives 52,596, against
+  52,598 actual. The history holds no other events (the only non-trade is the
+  OPENING_BALANCE deposit). Nothing is missing from the P&L.
+- **"Conversion" is inside the sells.** We hold only one side, so an exit
+  "sell NO @ 0.89" rests as a YES bid at 0.11. When it is hit, we receive YES,
+  and the YES+NO pair pays 1. The platform records that as SELL @ 0.89, with
+  no separate payout event. So essentially all realised P&L is pair-conversion
+  profit labelled as sells. The explicit 1,938 of payouts is exactly the
+  ex1059 short (night of 10-01) unwinding against YES.
+- **Exits are direct sells, not conversions.** The exit is economically the
+  same as "bid the other side and redeem the pair" (`STRATEGY.md` §2), but it
+  is submitted as a sell of the held side, and it settles as one. The 4
+  conversions came from incidental overlaps and net −10.
+- **The mirror earned as much as the main ladder in ~21 hours live.** It went
+  live 2026-10-02 17:05Z.
+- **One sell below average cost in the whole history:** ex971, 10 YES @ 0.955
+  against an average of 0.97, −0.15, on 2026-10-02 00:02Z. That was before the
+  current exit rule.
+- **Best markets:**
+  - ex1059 MA Governor D +7.0K;
+  - ex1076 RI Senate D +4.4K;
+  - ex1071 NH Senate R (mirror) +4.2K;
+  - ex1051 TN Senate D +4.2K;
+  - ex1074 RI Governor R (mirror) +3.9K.
+- **Reconciliation:** the replay's +54.1K is ~2.5K above the account's gain at
+  platform cost basis (+51.6K). History is complete; the gap is the cost-basis
+  method on the ~84K still open (average cost here, the platform's lots
+  there). It vanishes as those positions close.
+
+`watch_losses.py` now runs alongside the quoter. It alerts on any sell or
+conversion below average cost, any open position with its bid more than 3
+ticks under cost, and the quoter process dying.
+
+## 7. Lead-lag between legs (2026-10-07 09:50–10:55Z)
+
+**Question (user):** e.g. Vermont Governor: the NO on R and the YES on D should
+price the same event. Is there an arb, or does one leg lag the other in a way a
+taker could trade within minutes, without holding to settlement?
+
+**Vermont snapshot (09:4xZ):** R bid/ask 0.735/0.74, D 0.275/0.28.
+- Σ bids = 1.010. Buying NO on both costs 0.99 and pays ≥ 1, but only 307
+  shares are available at +0.01, and the payout waits until 11-04.
+- The web UI's "R No 26%" vs "D Yes 28%" compares a NO *ask* with a YES *ask*.
+  The difference is mostly spread.
+- The verdict in §2.3 stands: the edge is real but tiny and locks cash.
+
+**Method:**
+- `record_tape_ws.py` records every top-of-book change on all 233 race legs
+  (115 races) from the Realtime market channels. It is read-only and spends no
+  REST budget.
+- `analyze_leadlag.py`:
+  - **Episode:** the race's Σ mids moves ≥ `--dev` from its 30-min median, with
+    one leg (the leader) having moved first in that direction.
+  - **Trade:** the lagging sibling, toward coherence, entered 15s later at the
+    touch.
+  - **Exit:** at 1/2/5/10/30 min, at the opposite touch (taker) and at mid.
+
+**Result (65 min, 25,929 updates):**
+- |dev| ≥ 0.02: **1 episode** (Alaska Senate, +0.020). The lagger never moved;
+  the taker result was −0.005 at 1–2 min and 0 at 5–10 min.
+- |dev| ≥ 0.01: 14 episodes.
+  - **The lagger followed in 7%; the leader reverted in 29%** at 1–5 min, and
+    67% at 30 min.
+  - Median taker P&L was **−0.005 a share at every horizon**: the spread, with
+    no catch-up to pay for it. Even exiting at mid was −0.0025.
+  - On min(touch, 5K) shares per episode, that totals −246.
+
+**Reading:**
+- In this hour, siblings do not follow a jump. When the race stops adding up,
+  the gap persists, or the jumping leg comes back.
+- So the cross-leg gap is not a lead-lag signal. It is mostly noise of a tick
+  or two, and the leg that moved is as likely to be the "wrong" one.
+- **Caveat:** this was one quiet hour, at about half the 10-02/04 volume. The
+  big dislocations (sweeps) come a few times a day and are already harvested
+  passively by the ladders; this tape caught none.
+- A 24h tape would settle whether lead-lag appears around sweeps. Recording is
+  free (websocket), so it is the cheap next step if this is revisited.
+
+## 8. Backtest: lowering `--min-fair` to 0.70 (2026-10-07, window 10-05 00:00Z → 10-07 ~23:00Z)
+
+**Setup:**
+- `analyze_mirror.py`, comparing the two bands over the same window, with
+  4,000 cash per rung per leg. Profit = (current fair − rung price) × volume
+  traded through the rung.
+- Each run: `--min-fair/--max-fair`, `--max-pages 8`.
+- **New band 0.70–0.75: 9 races.** Current band 0.75–0.90: 41 races.
+
+| per leg | 0.70–0.75 (new) | 0.75–0.90 (current) |
+|---|---|---|
+| main ladder | 0 hits (0/9) | 633 total, 4/41 hits, all at 0.95 |
+| mirror | **98** (980 / 10 legs) | 20 (860 / 42 legs) |
+| cheap side, live rungs (+3,4,6,8,10 ticks) | **400** (3,604 / 9) | 332 (13,593 / 41) |
+| reverting sweeps (value to the passive side) | main DOWN 2 (3.5K), mirror UP 4 (10.6K) | main DOWN 1 (1.0K), UP 1 (9.9K); mirror UP 3 (6.4K) |
+
+**Reading:**
+- Per leg, the new band earns about as much as the current one, or more:
+  - the cheap side is similar (+20%);
+  - the mirror is ~5x;
+  - there are more reverting sweeps per race.
+- Main-ladder fills were rare in both bands: this was the quiet, half-volume period.
+
+**Caveats:**
+- These are upper bounds: queue position is ignored and all volume past a
+  price counts as ours.
+- Fair is TODAY's mid, so a race that genuinely repriced shows no loss here.
+  The stop-loss costs seen live are mostly cheap-side fills on 0.80–0.85
+  favourites, and they are NOT in these numbers.
+- Truncation (8 pages) dropped the oldest trades on 12 + 26 busy legs, which
+  undercounts both bands.
+- Only 9 races, so this is a small sample.
+- **Capacity:** the bot is already at the engine's resting cap (refusals since
+  10-07, §STRATEGY). Nine more races add rungs that compete for that cap, so
+  some may be refused unless `--race-pct` is trimmed.
+
+**Live result after ~23h at 0.70** (from `data/quoter.jsonl`, value at cost =
+cash + cost basis):
+
+| window (23.3h each) | value at cost | change | buy fills | buy notional |
+|---|---|---|---|---|
+| before: 10-07 04:02Z → 10-08 03:21Z (0.75) | 185,199 → 187,385 | **+2,186** | 318 | 176.6K |
+| after: 10-08 03:21Z → 10-09 02:42Z (0.70) | 187,385 → 190,284 | **+2,899** | 271 | 86.0K |
+
+- About a third more gain on less notional.
+- The before window held both the West Virginia sweep (+~1.7K) and the two
+  big stop-losses: Iowa −483 and Rhode Island Senate −633.
+- The after window's stops were all small: Iowa −~95, Georgia −~115, PA-07
+  −34, Texas Governor (a new-band race) ~0, and the rest ~0.
+- Refusals: 2 small passes (3 orders) in 23h.
+- One day each, dominated by single events, so this is not a statistically
+  meaningful A/B test. But no sign the new band hurts. **Decision: keep 0.70.**

@@ -1,5 +1,10 @@
 # Current strategy — living document
 
+> **Final status (2026-11-03): run complete.** Final balance **184,815.42** (+84.8%), flat since
+> 2026-11-02 00:13Z, rank 26 on 11-03. Nothing is trading. The full timeline, account curve,
+> incidents and lessons are in **`docs/run-history.md`**. The sections below are the strategy as it
+> ran. Final flags: `--min-fair 0.70 --race-pct 0.85 --budget-pct 135 --mirror 0.5 --cheap 0`.
+
 **Read this first.** `HANDOFF.md` is the original brief from 2026-10-01 and is
 kept for its rules and pricing background. This file is the current state of
 play. The measured evidence behind each decision lives in `docs/` (index at the
@@ -40,6 +45,8 @@ bottom). Last updated 2026-10-02 ~16:00Z.
 - **Mirror live from 17:05Z** (cash 103,318). Its first fills (ex991 52.7K NO,
   ex870 27.3K NO, ex1069 1.3K NO) and a 44K YES fill on ex1025 were all
   exited by ~20:00Z.
+- **2026-10-02 22:09Z:** cash **129,998** (+30.0K realised overall).
+  The run was then restarted with `--max-hours 48`, ending ~2026-10-04 22:09Z.
 - **2026-10-02 ~20:00Z:** cash **121,979**, no open positions. That is
   **+22.0K realised** overall, of which **+18.7K came in the ~3h after the
   mirror went live**.
@@ -55,8 +62,11 @@ D went from 0.68 to 0.165 and back in 75s (~52K to the resting side), and about
 226K moved this way in 30 markets in 5h. It is only capturable passively: the
 API takes 2–17s per call, so we cannot react in time (`docs/sweep-opportunity.md`).
 
-- **Where we quote:** the favoured leg of every race with fair ≥ 0.75
-  (`--min-fair`; 0.90 until 2026-10-02 ~20:15Z).
+- **Where we quote:** the favoured leg of every race with fair ≥ 0.70
+  (`--min-fair`). It was 0.90 until 2026-10-02 ~20:15Z, then 0.75 until
+  2026-10-08 03:24Z. Lowered after a backtest showed the 0.70–0.75 band earns
+  as much per race or more (`docs/mirror-and-arb-recheck.md` §8). On trial:
+  compare a day's fills, stops and refusals, and revert if worse.
   - Fair is the leg's mid, averaged with 1 − Σ(sibling mids).
   - A race is skipped if the legs disagree by more than 0.08.
   - Fair is snapped to a 0.02 grid, so normal book wobble doesn't trigger
@@ -68,8 +78,8 @@ API takes 2–17s per call, so we cannot react in time (`docs/sweep-opportunity.
     traded below 0.78 of fair, so these are cheap lottery tickets only.
   - Every rung sits strictly below the best bid, so nothing crosses.
 - **Overbooked on purpose (user decision).** The current flags are
-  `--race-pct 1.0 --budget-pct 120`: each race may rest up to 100% of cash, and
-  the total resting can reach 120x cash. It was raised from 60x on 2026-10-02
+  `--race-pct 0.85 --budget-pct 135` (since 2026-10-06): each race may rest up to
+  85% of cash, and the total resting can reach 135x cash. That was 1.0/120 before the cheap side. It was raised from 60x on 2026-10-02
   ~20:30Z: with the mirror at 0.5, each race uses ~1.5x cash, and 60x had been
   silently capping us at ~40 races (see the lesson below). Measured engine behaviour (10-01):
   - each order is **shrunk at placement** to at most 100% of cash, and the
@@ -80,6 +90,32 @@ API takes 2–17s per call, so we cannot react in time (`docs/sweep-opportunity.
   - **sells are unaffected** (verified at 72.8x overbooking), so exits always
     work.
   - So a sweep hitting several races at once is rationed by the engine.
+- **Cheap side OFF since 2026-10-22 (`--cheap 0`).** First it was capped at NO < 0.10 (2026-10-21, `--cheap-max-no 0.10`). From 10-12 to 10-21, the cheap
+  rungs at NO 0.10-0.25 took most of the big stop losses: 50-180K shares, 1-2 ticks each.
+  Only rungs below 0.10 made money. Each pass also pulls buy rungs on races that
+  no longer qualify (`pull_orphans`). See docs/loss-analysis-1013-1020.md.
+- **Undocumented total cap at ~129x cash (found 2026-10-06).** When the cheap side
+  went live at `--race-pct 1.0 --budget-pct 135`, only 22 of 357 cheap rungs
+  rested. Past ~129x cash in total resting notional, the engine refuses new
+  buys with 200/ok, `orderId: null`, `open: false`, and no error. Fix: we now run
+  `--race-pct 0.85 --budget-pct 135` (~119x), and `apply_plan` counts refusals.
+  The pass line shows `!! N REFUSED` and the jsonl has `refused`. After the fix,
+  0 orders were refused and 244 cheap rungs rested on 55 favourites.
+  - **Back at the cap, 2026-10-07 (~pass 128+, cash 178.6K).** Rung sizes grow
+    with cash, so refusals returned: 1–2 rungs per race, 9 in pass 131 out of
+    ~1,700 resting. Total resting buys were ~19.4M at price (~109x cash), so
+    the cap is NOT simply 129x cash. It may be absolute, or tied to something
+    else; this is unresolved. Decision: **keep race-pct 0.85**. Dropping to 0.80
+    would shrink every rung ~6%, far more size than the few refused deep rungs.
+    Revisit if refusals exceed ~5% of rungs per pass. `monitor_alerts.py` now
+    alerts only when a pass total is ≥ 10.
+- **Ladder matching uses the closest price (fixed 2026-10-06 17:53Z).**
+  `ladder_matches` used to pair each wanted rung with the first resting order
+  within 3 ticks. Cheap rungs (0.04/0.03/0.02/0.01/0.005) sit 1–2 ticks apart,
+  so they were mis-paired, the last rung went unmatched, and ~80 ladders were
+  reposted every pass: ~200 writes and 12-minute passes. It now pairs each
+  rung with the closest-priced candidate. The pass after the fix: 25 writes,
+  142 unchanged, 268s (before: 199 writes, 77 unchanged, 687s).
 - **Proof it works:** 2026-10-02 15:26Z on Massachusetts Governor D. 110,324
   shares filled at an average of 0.842 against a recovered price of about 0.905,
   roughly +7K, and nearly all of it was exited within 30 minutes
@@ -163,6 +199,15 @@ Full design and the bugs behind it are in `docs/exit-management.md`.
 
 ## 5. Not yet built: candidates for what comes next
 
+- **Cheap side: LIVE since 2026-10-06 (`--cheap 0.1`).** NO bids on each
+  favourite at 0.005–0.05 (`CHEAP_RUNGS` in `sigcup/quoter.py`), i.e. YES offers
+  above the ask. The idea came from `docs/leader-analysis.md`: rank 1 made +753K
+  on 19.6M of volume in one day at a flat 3.84%. The first fills were Georgia D
+  (ex947, 17,141 NO @0.045) and Delaware D (ex1042, 12,962 NO @0.095).
+- **Chamber markets:** m151 was dumped to 0.64 and 0.72 today (~1M volume each).
+- **Deeper mirror sizing:** longshot spikes reached 0.30–0.60 YES today, where
+  the mirror's deep rungs carry little size.
+
 - **Chamber-control markets (151–154).** They had the biggest sweeps on record
   (87K and 41K to the resting side), but they are excluded today: they have no
   `raceId` and settle manually.
@@ -172,6 +217,31 @@ Full design and the bugs behind it are in `docs/exit-management.md`.
   free; today `rearm` polls positions.
 
 ## 6. Known risks and gaps
+
+- **Genuine repricings now stop out** (see `docs/exit-management.md`, Stop-loss):
+  underwater ≥3h with coherent legs, or ≥8h, drops the cost floor and pulls the race
+  from the ladders until the position has fully closed, then the race is
+  re-admitted automatically (since 2026-10-06). Manual control:
+  `data/overrides.json` (hot-reloaded). **Since 2026-10-11: stop-loss v2**: no
+  adds to positions ≥2 ticks under cost, stop exits sell in slices at the bid,
+  stops cancel on recovery, tiny stops keep their race, `permanent_exclude`
+  (RI Gov Independent). See `docs/exit-management.md`. 2026-10-06 stops: CO-08 R ≈ −450, SD
+  Senate R ≈ −300 (8h cap), TN Senate R −4, NH Senate D ≈ 0.
+
+- **Platform outages (2026-10-02/03).**
+  - The fills endpoint froze at 21:48Z (see `docs/exit-management.md`).
+  - At ~03:15Z a ladder post got a 404 whose body was `"error": "Not Found"`
+    (a bare string). The client crashed parsing it (AttributeError), and the
+    main loop caught only ApiError/OSError, so **the process died, exit thread
+    included**. Fixed: the client normalises any error body, and both loops now
+    catch every Exception.
+  - Then the whole API went down: `sig.` returned 404 on every endpoint (site
+    500), and `www.` returned 500 with our key.
+  - Resting orders stay on the exchange through an outage, but nothing manages
+    them. A watchdog (`scratchpad/wait_and_relaunch.sh`) polls once a minute and
+    relaunches the quoter with the same flags when authenticated reads work.
+  - Note: the quoter's startup `c.balance()` sits outside the retry loop, so it
+    exits if the API is down at launch. That is why it needs a watchdog.
 
 - **The global budget cap can silently undo other settings.** It admits races
   by descending fair until full. When the mirror went live, the cap trimmed
@@ -196,18 +266,25 @@ Full design and the bugs behind it are in `docs/exit-management.md`.
 
 ## 7. Operations
 
+**Runs non-stop under a supervisor** (since 2026-10-06 ~03:30Z):
+
 ```bash
-# live command (logs: data/quoterN.log; per-pass JSON: data/quoter.jsonl)
-nohup caffeinate -ims python3 -u run_quoter.py --live --race-pct 1.0 --budget-pct 120 \
-  --max-deploy-pct 1.0 --cash-floor-pct 0.02 --shrink-tol 0.95 --min-fair 0.75 \
-  --mirror 0.5 --unwind --unwind-interval 120 --min-exit-edge 0.005 --reprice-ticks 2 \
-  --interval 180 --max-hours 24 --log data/quoter.jsonl > data/quoterN.log 2>&1 &
+nohup caffeinate -ims ./supervise.sh >> data/supervisor.log 2>&1 &   # start
+touch data/STOP                                                      # stop
 ```
 
-- **Stopping:** send SIGTERM. It finishes the current pass, then exits.
-  Resting orders stay on the book, and the next process picks them up.
-- **Health:** `grep -E "^pass|rearm|TOP-UP|OVER|FAIL" data/quoterN.log`
-- **Fills in real time:** `watch_fills.py` (Realtime websocket, observe-only)
+- `supervise.sh` starts `run_quoter.py` with the live flags and **no
+  `--max-hours`**, and relaunches it 30s after any exit (crash, hard stop, API
+  down at startup), each time into a fresh `data/quoterN.log`.
+- `touch data/STOP` asks the running quoter to finish its pass and stops the
+  supervisor for good. Resting orders stay on the book.
+- Alongside it: `watch_losses.py` (alerts to `data/watch_losses.log`) and
+  `monitor_alerts.py` (one-process alert stream for monitoring sessions).
+- Manual control without a restart: `data/overrides.json` (exit floors,
+  `no_ladder`).
+- **The Mac must stay awake and online.** On battery with the lid closed it
+  sleeps whatever caffeinate says, and the bot pauses (2026-10-03 commute,
+  2026-10-05 evening). An always-on server would remove this.
 
 ## Doc index
 
@@ -218,5 +295,8 @@ nohup caffeinate -ims python3 -u run_quoter.py --live --race-pct 1.0 --budget-pc
 | `docs/sweep-opportunity.md` | Why sweeps are the opportunity; the Alaska event |
 | `docs/dutch-book-assessment.md` | Cross-leg arb, assessed and rejected |
 | `docs/exit-management.md` | Exit design, write priority, the lag and cancel-all bugs |
-| `docs/mirror-and-arb-recheck.md` | Mirror ladder + arb re-check results (pending) |
+| `docs/leader-analysis.md` | How rank 1 made +753K in a day (inferred from market data) |
+| `docs/mirror-and-arb-recheck.md` | Mirror ladder, arb re-check, lead-lag, min-fair 0.70 backtest |
+| `docs/loss-analysis-1013-1020.md` | Losses 10-13→10-21, cheap-side cap/off, pre-election stop, Nov 2 review |
+| `docs/run-history.md` | **Whole-run record: result, daily account values, timeline, lessons** |
 | `docs/api-overview.md`, `docs/guide-*.md` | Platform reference |
