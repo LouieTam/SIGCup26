@@ -4,11 +4,16 @@ This is the record of the whole run. The evidence behind each step lives in the 
 `STRATEGY.md` describes the strategy and its rules.
 
 ## Result
-- **Final balance: 184,815.42 SUSQies**, from 100,000 at the start. That is **+84,815 (+84.8%)**, all in cash.
-  - We have been flat (no positions, no orders) since 2026-11-02 00:13Z, so election settlement cannot change it.
-- **Leaderboard on 2026-11-03 ~02:40Z: rank 26** by P&L.
-  - The paid top 3 were at +963K to +980K. Neighbours: #23 +90.6K, #25 +87.3K, #27 +80.8K.
-  - The rank can still move as other accounts' positions settle; ours cannot.
+- **Ladders' final balance: 184,815.42 SUSQies**, from 100,000 at the start. That is **+84,815 (+84.8%)**, in cash at 11-02 00:13Z.
+- **Final trade (11-03, held to settlement):** NO on 21 overpriced longshot legs, costing 150,093 for 163,240 shares.
+  - If all resolve NO: about **197,960 (+97.96K)**.
+  - Expected at Polymarket's prices: about +9.8K on the ladder balance.
+  - One upset costs that leg's cost, at most 12K.
+  - See "11-03: selling longshots" below.
+- **Leaderboard on 2026-11-03 12:47Z: rank 28** at +84,815, before the longshot trade.
+  - The paid top 3 were at +994K to +1,000K.
+  - Neighbours: #23 +98.1K, #24 +95.3K, #25 +91.2K, #26 +86.6K, #27 +85.3K.
+  - Final standings are locked only after every market settles.
 - **Highest real value: 198,136** on 2026-10-13 21:51Z. That was cash while nearly flat (cost basis 13), so it is not a mark.
 
 ## Account value by day (end of day, UTC; cash + cost basis from data/quoter.jsonl)
@@ -31,7 +36,7 @@ Cost basis uses the platform's avgCost, which is sticky. When the basis is large
 | 10-12 | 189,553 | | 10-30 | 186,680 (flat) |
 | 10-13 | 198,331 | | 10-31 | 187,980 |
 | 10-14 | 196,978 | | 11-01 | 185,058 → **184,815 flat at 11-02 00:13Z** |
-| 10-15 | ~200,436 (at cost, 66K held; real value lower) | | 11-02, 11-03 | 184,815 (flat, not trading) |
+| 10-15 | ~200,436 (at cost, 66K held; real value lower) | | 11-02, 11-03 | 184,815 (flat; 11-03 12:58Z longshot NO trade, 150.1K cost) |
 
 **Shape of the run:**
 - **10-01 to 10-04:** +79K. Large sweeps reverted fast, and early on few others were resting liquidity.
@@ -109,6 +114,27 @@ Cost basis uses the platform's avgCost, which is sticky. When the basis is large
   - flash crashes reverted (Arkansas Senate R 0.90 → 0.14 → 0.855);
   - the top 3 were out of reach, so we **stayed flat for election day**.
 
+### 11-03: selling longshots against Polymarket (`sell_longshots.py`, log `data/longshots.jsonl`)
+- **Why:** rank had slipped from 23 to 28 while we were flat, and neighbours were gaining 5–13K a day.
+  - The user asked about selling very unlikely events, and pointed out that Polymarket had Rhode Island at 99% D against about 92% here.
+  - This trade is unlike the dip-buying stopped on 11-01: it needs no reversion and no stop, it is held to settlement, and the laptop need not stay online. It is close to the mirror ladder, the one ladder that made money.
+- **Cross-check (12:50Z), Polymarket winner-market ask against our YES bid:**
+  - Most deep-safe longshots were 3–9c rich here: RI Senate R 0.8% vs 8%, SD Senate D 0.05% vs 7%, ID Senate D 0.05% vs 8.5%, DE Senate R 1.2% vs 9%, MA Senate R 0.9% vs 8%, VA Senate R 0.7% vs 6.5%.
+  - It also exposed traps: **Louisiana Senate D was 13% on Polymarket** (bid 10% here), Montana Senate I 8.9%, VA-02 R 9.5%, TN-05 D 12.8% and SC Gov D 4.85%. These were all excluded.
+- **Rule:**
+  - p = Polymarket best ask.
+  - Sell YES (buy NO into resting YES bids) only down to max(p + 2.5c, 3.5c).
+  - Risk cap per leg: 12K if p ≤ 1.5%, 8K if ≤ 3%, 5K if ≤ 5.5%.
+  - Legs ordered by edge; 150K total.
+  - A 100-share test confirmed that a NO buy at 0.95 fills against the 0.07 YES bid at 0.93.
+- **Filled 12:58Z: 21 legs, all fully, no orders left.**
+  - Biggest legs: RI Gov R, RI Senate R, SD Senate D, MA Senate R (about 12K each); ID Senate D (9.7K); DE Senate R (8.6K).
+  - Also Idaho Gov D, Colorado Senate R, Tennessee Senate D and Oklahoma Senate D.
+  - Smaller 5K legs where p is 3–5%: NM Gov R, NY Gov R, AR Senate D, KY-04 D, MN-02 R, CA-48 R, NH-01 R.
+  - Cash after: 34,722.88.
+- **Payoff:** +13,147 if all NO. Expected about +9.8K at Polymarket's prices.
+  - The leaderboard marks the positions at about −1.7K (the spread) until they settle.
+
 ## Lessons
 1. **The edge was speed of reversion, not price level.** Positions exited within 3h were essentially always winners; positions held longer lost. Every rule that kept us in longer (deep rungs, cheap side, waiting for cost) cost money.
 2. **Infrastructure losses dwarfed strategy losses.** The single worst episode (−10.5K) was a laptop's Wi-Fi plus a hung process, not a bad trade. An always-on server and a watchdog from day one would have been worth more than any parameter tweak.
@@ -123,6 +149,7 @@ Cost basis uses the platform's avgCost, which is sticky. When the basis is large
   - `supervise.sh` runs `run_quoter.py` with the final flags: `--min-fair 0.70 --race-pct 0.85 --budget-pct 135 --mirror 0.5 --cheap 0`, stop-loss v2, watchdog.
   - Stop: `touch data/STOP`.
 - **Wind-down:** `winddown.py`. Cancels buys and runs exits until flat, then exits.
+- **Longshot sale:** `sell_longshots.py` (dry run by default; `--live` places). One shot, holds to settlement.
 - **Monitoring:**
   - `watch_losses.py`: loss and underwater alerts.
   - `monitor_alerts.py`: one alert stream for the bot plus the watcher.
