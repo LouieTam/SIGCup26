@@ -145,6 +145,12 @@ Cost basis uses the platform's avgCost, which is sticky. When the basis is large
   - **Bug found and fixed first:** the Polymarket matcher accepted any slug that contained the state, so "Virginia Senate" matched `west-virginia-senate-…` (Kansas/Arkansas could collide the same way). It now requires the exact state prefix and the office. All 21 first-round legs had been matched correctly (checked against the logged slugs).
 - **Combined payoff if every leg goes our way: about +14.1K**, i.e. about 198.9K.
 
+- **Overnight check, 11-04 12:43Z:**
+  - Polymarket had **resolved 26 of our 28 legs, all in our favour**. The other two are also going our way: AZ-06 D at 99%, CA-48 R at 0.45%.
+  - Nothing has settled on the platform yet.
+  - The platform marks were badly off, −7.0K in total: NY Gov D YES marked 0.61, KY Senate D NO at 0.37, AZ Gov D YES at 0.73. The cause was erratic sweeps in thin books (NY Gov D printed 0.085, then 0.58, then 0.98 within a minute), with identical 43,538/30,000-share orders across several books.
+  - The marks put us at rank 49. At settlement we receive 197,138 for the shares, plus 1,802 cash = **about 198.9K (+98.9K)**, about #36 on that board.
+
 ## Lessons
 1. **The edge was speed of reversion, not price level.** Positions exited within 3h were essentially always winners; positions held longer lost. Every rule that kept us in longer (deep rungs, cheap side, waiting for cost) cost money.
 2. **Infrastructure losses dwarfed strategy losses.** The single worst episode (−10.5K) was a laptop's Wi-Fi plus a hung process, not a bad trade. An always-on server and a watchdog from day one would have been worth more than any parameter tweak.
