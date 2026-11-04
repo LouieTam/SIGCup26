@@ -303,4 +303,5 @@ touch data/STOP                                                      # stop
 | `docs/mirror-and-arb-recheck.md` | Mirror ladder, arb re-check, lead-lag, min-fair 0.70 backtest |
 | `docs/loss-analysis-1013-1020.md` | Losses 10-13→10-21, cheap-side cap/off, pre-election stop, Nov 2 review |
 | `docs/run-history.md` | **Whole-run record: result, daily account values, timeline, lessons** |
+| `docs/election-night-analysis.md` | How the big players earned on election night (direction vs. speed vs. Polymarket gap) |
 | `docs/api-overview.md`, `docs/guide-*.md` | Platform reference |
