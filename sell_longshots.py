@@ -56,7 +56,11 @@ def poly_prob(title: str) -> tuple[float, str] | None:
     d = json.load(urllib.request.urlopen(req, timeout=20, context=_ssl_context()))
     for e in d.get("events", []):
         slug = e.get("slug", "")
-        if e.get("closed") or "winner" not in slug or place.lower().replace(" ", "-") not in slug:
+        # Exact state/district prefix and office: "virginia-senate" is inside
+        # "west-virginia-senate", and "kansas" inside "arkansas".
+        if (e.get("closed") or "winner" not in slug
+                or not slug.startswith(place.lower().replace(" ", "-") + "-")
+                or office.split()[0].lower() not in slug):
             continue
         for mk in e.get("markets", []):
             if PARTY[party] in mk.get("question", "").lower() and mk.get("outcomePrices"):
@@ -76,6 +80,14 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--live", action="store_true")
     ap.add_argument("--budget", type=float, default=150_000, help="total risk (cash) to commit")
+    ap.add_argument("--max-p", type=float, default=None,
+                    help="only legs whose Polymarket price is at most this (e.g. 0.003 for called races)")
+    ap.add_argument("--cap", type=float, default=None, help="flat risk cap per leg (overrides CAPS)")
+    ap.add_argument("--min-edge", type=float, default=MIN_EDGE)
+    ap.add_argument("--min-price", type=float, default=MIN_PRICE)
+    ap.add_argument("--max-bid", type=float, default=MAX_BID)
+    ap.add_argument("--favourites", action="store_true",
+                    help="instead: buy YES on called winners (Polymarket >= 1-max-p) offered below it")
     args = ap.parse_args()
     load_env()
     c = SuperMarketClient(allow_trading=args.live)
@@ -86,18 +98,23 @@ def main() -> int:
         for it in c.prices(ids[i:i + 100]).get("data", []):
             snap[str(it["exchangeId"])] = it
 
+    if args.favourites:
+        return favourites(c, cat, snap, args)
+
     cands = []
     for x, p in snap.items():
         bid = p.get("bestBid")
-        if bid is None or not (MIN_PRICE <= bid <= MAX_BID) or x in EXCLUDE:
+        if bid is None or not (args.min_price <= bid <= args.max_bid) or x in EXCLUDE:
             continue
         pp = poly_prob(cat[x]["title"])
         if not pp:
             continue
         prob, slug = pp
-        floor = round(max(prob + MIN_EDGE, MIN_PRICE) + 0.0049, 3)
+        if args.max_p is not None and prob > args.max_p:
+            continue
+        floor = round(max(prob + args.min_edge, args.min_price) + 0.0049, 3)
         floor = round(round(floor / 0.005) * 0.005, 3)
-        cap = risk_cap(prob)
+        cap = args.cap if args.cap is not None else risk_cap(prob)
         if cap and bid >= floor:
             cands.append(dict(x=x, title=cat[x]["title"], bid=bid, poly=prob, slug=slug,
                               floor=floor, cap=cap, edge=bid - prob))
@@ -149,6 +166,68 @@ def main() -> int:
             print(f"{now()} {d['x']}: traded {r.get('quantityTraded')} of {d['qty']} "
                   f"@ {r.get('fillPrice')} cost {r.get('totalCost')} {r.get('error', '')}", flush=True)
             f.write(json.dumps({"at": now(), "plan": d, "result": r}) + "\n")
+            time.sleep(1)
+    print(f"{now()} done. cash {c.balance():,.2f}")
+    return 0
+
+
+def favourites(c: SuperMarketClient, cat: dict, snap: dict, args) -> int:
+    """Buy YES on legs Polymarket treats as decided (>= 1 - max_p) where our
+    offers sit below Polymarket by min_edge. Held to settlement like the rest."""
+    max_p = args.max_p if args.max_p is not None else 0.003
+    cands = []
+    for x, p in snap.items():
+        ask = p.get("bestAsk")
+        if ask is None or not (0.4 <= ask <= 0.99) or x in EXCLUDE:
+            continue
+        pp = poly_prob(cat[x]["title"])
+        if not pp or pp[0] < 1 - max_p:
+            continue
+        ceiling = round(int((pp[0] - args.min_edge) / 0.005) * 0.005, 3)
+        if ask <= ceiling:
+            cands.append(dict(x=x, title=cat[x]["title"], ask=ask, poly=pp[0], slug=pp[1],
+                              ceiling=ceiling, edge=pp[0] - ask))
+    cands.sort(key=lambda d: -d["edge"])
+    left, plan = args.budget, []
+    cap = args.cap if args.cap is not None else 8_000
+    for d in cands:
+        if left <= 100:
+            break
+        ob = c.exchange_orderbook(d["x"], depth=60)
+        qty, cost, high = 0, 0.0, None
+        for lv in ob["asks"]:
+            px = lv["price"]
+            if px > d["ceiling"] + 1e-9:
+                break
+            q = min(lv["quantity"], int((min(cap, left) - cost) / px))
+            if q <= 0:
+                break
+            qty += q; cost += q * px; high = px
+        if qty < 100:
+            continue
+        left -= cost
+        d.update(qty=qty, risk=round(cost), limit_yes=high, gain=round(qty - cost))
+        plan.append(d)
+    for d in plan:
+        print(f"{d['x']:>5} {d['title'][9:62]:<53} ask {d['ask']:.3f} poly {d['poly']:.3f} "
+              f"YES {d['qty']:>6,} @<= {d['limit_yes']:.3f}  cost {d['risk']:>6,}  gain if YES {d['gain']:>4,}")
+    print(f"{len(plan)} legs: cost {sum(d['risk'] for d in plan):,}  gain if all YES {sum(d['gain'] for d in plan):,}")
+    if not args.live:
+        return 0
+    with open(LOG, "a") as f:
+        for d in plan:
+            try:
+                r = c.place_order(d["x"], "yes", "buy", d["qty"], price=d["limit_yes"])
+            except Exception as e:  # noqa: BLE001 - log and move on
+                r = {"error": f"{type(e).__name__}: {e}"}
+            if r.get("open"):
+                try:
+                    c.cancel(str(r["orderId"]))
+                except Exception as e:  # noqa: BLE001
+                    r["cancelError"] = str(e)
+            print(f"{now()} {d['x']}: traded {r.get('quantityTraded')} of {d['qty']} "
+                  f"@ {r.get('fillPrice')} cost {r.get('totalCost')} {r.get('error', '')}", flush=True)
+            f.write(json.dumps({"at": now(), "mode": "favourite", "plan": d, "result": r}) + "\n")
             time.sleep(1)
     print(f"{now()} done. cash {c.balance():,.2f}")
     return 0

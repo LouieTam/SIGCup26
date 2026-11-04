@@ -3,7 +3,8 @@
 > **Final status (2026-11-03): ladders done; one hold-to-settlement trade open.** The ladders were
 > flat at **184,815.42** (+84.8%) from 2026-11-02 00:13Z; rank 28 on 11-03. At 12:58Z on 11-03,
 > `sell_longshots.py` bought NO on 21 overpriced longshot legs (150.1K cost, 163,240 shares), cross-checked
-> against Polymarket, and holds them to settlement: **+13.1K if all resolve NO**, about +9.8K expected.
+> against Polymarket, and holds them to settlement: **+13.1K if all resolve NO**, about +9.8K expected. On 11-04 04:10Z the spare
+> 32.9K bought YES on 7 called winners below Polymarket (+977 if all win).
 > Nothing else is trading. Full timeline, account curve, incidents and lessons: **`docs/run-history.md`**.
 > The sections below are the strategy as it ran. Final ladder flags:
 > `--min-fair 0.70 --race-pct 0.85 --budget-pct 135 --mirror 0.5 --cheap 0`.

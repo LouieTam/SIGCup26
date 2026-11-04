@@ -135,6 +135,16 @@ Cost basis uses the platform's avgCost, which is sticky. When the basis is large
 - **Payoff:** +13,147 if all NO. Expected about +9.8K at Polymarket's prices.
   - The leaderboard marks the positions at about −1.7K (the spread) until they settle.
 
+- **Second round, 11-04 04:10Z (user approved): buy YES on called winners with the spare cash.**
+  - At 04:05Z our 21 legs were +2.2K at the marks. Polymarket had about 15 of them at 0.1–0.4%, and none had settled.
+  - The platform still offered winners Polymarket treated as decided at 0.95–0.975, so `sell_longshots.py --favourites --max-p 0.003 --min-edge 0.02 --cap 8000 --budget 33000` bought YES:
+    - New York Gov D, South Dakota Gov R, Wyoming Senate R, Maine Gov D, Arizona Gov D, AZ-06 D, TX-15 D;
+    - 33,898 shares for 32,921, so **+977 if all win**.
+  - A second longshot round had only +0.9K available by then; bids had decayed to 2.5–4c.
+  - Cash after: 1,801.93.
+  - **Bug found and fixed first:** the Polymarket matcher accepted any slug that contained the state, so "Virginia Senate" matched `west-virginia-senate-…` (Kansas/Arkansas could collide the same way). It now requires the exact state prefix and the office. All 21 first-round legs had been matched correctly (checked against the logged slugs).
+- **Combined payoff if every leg goes our way: about +14.1K**, i.e. about 198.9K.
+
 ## Lessons
 1. **The edge was speed of reversion, not price level.** Positions exited within 3h were essentially always winners; positions held longer lost. Every rule that kept us in longer (deep rungs, cheap side, waiting for cost) cost money.
 2. **Infrastructure losses dwarfed strategy losses.** The single worst episode (−10.5K) was a laptop's Wi-Fi plus a hung process, not a bad trade. An always-on server and a watchdog from day one would have been worth more than any parameter tweak.
