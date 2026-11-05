@@ -151,6 +151,12 @@ Cost basis uses the platform's avgCost, which is sticky. When the basis is large
   - The platform marks were badly off, −7.0K in total: NY Gov D YES marked 0.61, KY Senate D NO at 0.37, AZ Gov D YES at 0.73. The cause was erratic sweeps in thin books (NY Gov D printed 0.085, then 0.58, then 0.98 within a minute), with identical 43,538/30,000-share orders across several books.
   - The marks put us at rank 49. At settlement we receive 197,138 for the shares, plus 1,802 cash = **about 198.9K (+98.9K)**, about #36 on that board.
 
+- **Settlement in progress, 11-05:**
+  - 22 of our 28 legs have settled, all in our favour. Cash is **164,043.93**.
+  - Still open: 848 AZ Gov D YES, 859 Idaho Gov D NO, 888 AZ-06 D YES, 893 CA-48 R NO, 908 KY-04 D NO, 951 Idaho Senate D NO. All six are going our way on Polymarket.
+  - The board shows **#46 of 1,969 at +96,548**, with the six open legs valued at market (−2.4K against settlement).
+  - If all six settle our way: **198,940 (+98,940)**, which places between #43 (+99.0K) and #44 (+98.1K) on today's board, before other accounts' remaining legs settle.
+
 ## Lessons
 1. **The edge was speed of reversion, not price level.** Positions exited within 3h were essentially always winners; positions held longer lost. Every rule that kept us in longer (deep rungs, cheap side, waiting for cost) cost money.
 2. **Infrastructure losses dwarfed strategy losses.** The single worst episode (−10.5K) was a laptop's Wi-Fi plus a hung process, not a bad trade. An always-on server and a watchdog from day one would have been worth more than any parameter tweak.
