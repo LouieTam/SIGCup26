@@ -156,6 +156,9 @@ Cost basis uses the platform's avgCost, which is sticky. When the basis is large
   - Still open: 848 AZ Gov D YES, 859 Idaho Gov D NO, 888 AZ-06 D YES, 893 CA-48 R NO, 908 KY-04 D NO, 951 Idaho Senate D NO. All six are going our way on Polymarket.
   - The board shows **#46 of 1,969 at +96,548**, with the six open legs valued at market (−2.4K against settlement).
   - If all six settle our way: **198,940 (+98,940)**, which places between #43 (+99.0K) and #44 (+98.1K) on today's board, before other accounts' remaining legs settle.
+- **11-06:** 25 of 28 legs settled, all ours. Cash **187,081.93**; board **#44 at +98,067**.
+  - Open: 888 AZ-06 D YES, 893 CA-48 R NO, 908 KY-04 D NO (House races, slower to settle). They are valued at −873 against settlement.
+  - When they settle our way: **+98,940**, which passes #43 kind-comet (+98,091) for **#43**. #42 (+100,890) is out of reach.
 
 ## Lessons
 1. **The edge was speed of reversion, not price level.** Positions exited within 3h were essentially always winners; positions held longer lost. Every rule that kept us in longer (deep rungs, cheap side, waiting for cost) cost money.
