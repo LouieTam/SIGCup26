@@ -4,6 +4,10 @@ This is the record of the whole run. The evidence behind each step lives in the 
 `STRATEGY.md` describes the strategy and its rules.
 
 ## Result
+- **FINAL (all markets settled, checked 2026-11-11): rank 43 of 1,969, balance 198,939.93 SUSQies (+98,939.93, +98.9%).**
+  - All 28 election-day legs settled our way.
+  - Neighbours: #42 gentle-pebble +101,689; #44 kind-comet +98,091.
+  - Top 3: nimble-beacon +1,424,479; steady-finch +1,360,150; steady-ember +1,294,175.
 - **Ladders' final balance: 184,815.42 SUSQies**, from 100,000 at the start. That is **+84,815 (+84.8%)**, in cash at 11-02 00:13Z.
 - **Final trade (11-03, held to settlement):** NO on 21 overpriced longshot legs, costing 150,093 for 163,240 shares.
   - If all resolve NO: about **197,960 (+97.96K)**.
@@ -159,6 +163,7 @@ Cost basis uses the platform's avgCost, which is sticky. When the basis is large
 - **11-06:** 25 of 28 legs settled, all ours. Cash **187,081.93**; board **#44 at +98,067**.
   - Open: 888 AZ-06 D YES, 893 CA-48 R NO, 908 KY-04 D NO (House races, slower to settle). They are valued at −873 against settlement.
   - When they settle our way: **+98,940**, which passes #43 kind-comet (+98,091) for **#43**. #42 (+100,890) is out of reach.
+- **Final, checked 11-11:** all 28 legs settled our way, no open positions. Cash **198,939.93 (+98,939.93)**, **rank 43 of 1,969**.
 
 ## Lessons
 1. **The edge was speed of reversion, not price level.** Positions exited within 3h were essentially always winners; positions held longer lost. Every rule that kept us in longer (deep rungs, cheap side, waiting for cost) cost money.
